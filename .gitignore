@@ -1,0 +1,10 @@
+node_modules/
+build/
+dist/
+*.mcpb
+*.log
+*.tsbuildinfo
+.env
+.env.*
+.DS_Store
+Thumbs.db

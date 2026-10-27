@@ -1,0 +1,56 @@
+{
+  "name": "uca-mcp",
+  "version": "1.0.0",
+  "description": "Model Context Protocol (MCP) server para la Universidad Católica Argentina (UCA) - Proyecto No Oficial",
+  "type": "module",
+  "main": "build/src/index.js",
+  "bin": {
+    "uca-mcp": "build/bin/cli.js"
+  },
+  "files": [
+    "build/src",
+    "build/bin",
+    "src",
+    "scripts",
+    "bin",
+    "vendor",
+    "manifest.json",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
+  ],
+  "license": "MIT",
+  "author": "Comunidad Estudiantil UCA",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/santinohicke/uca-mcp.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "node scripts/vendor-pdfjs.mjs && tsc",
+    "prepublishOnly": "node scripts/vendor-pdfjs.mjs && tsc",
+    "dev": "node build/bin/cli.js",
+    "doctor": "node build/bin/cli.js doctor",
+    "login": "node build/bin/cli.js login",
+    "status": "node build/bin/cli.js status",
+    "logout": "node build/bin/cli.js logout",
+    "pack:mcpb": "node scripts/vendor-pdfjs.mjs && tsc && node scripts/pack-mcpb.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "cheerio": "^1.2.0",
+    "fflate": "^0.8.3",
+    "playwright-core": "^1.64.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "pdfjs-dist": "^4.10.38",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.18.1"
+  }
+}
