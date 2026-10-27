@@ -52,7 +52,7 @@ Si preferís usar la terminal o tu cliente requiere configuración por comando, 
    ```
    Comprueba versión de Node.js, modo de llavero (Windows / macOS / Linux), navegador detectado, herramienta de diálogo nativo y conectividad directa a EVA, SIU Guaraní y Campus.
 
-*(También podés correrlo directamente sin instalar ejecutando `npx -y uca-mcp <comando>`, aunque en Windows `npx` agrega demoras de red en cada arranque).*
+*(Asegurate de tener Node.js instalado en tu computadora antes de correr npm).*
 
 ---
 
@@ -72,18 +72,18 @@ Si no usás el archivo `.mcpb`, agregalo a tu `claude_desktop_config.json`:
   }
 }
 ```
-*(En Windows, si la interfaz de Claude no hereda el PATH de Node.js, podés especificar `"command": "cmd.exe"` y `"args": ["/c", "npx", "-y", "uca-mcp"]`)*.
+*(En Windows, si Claude no detecta el comando global, podés ejecutar `uca-mcp setup claude` para que lo vincule automáticamente con la ruta directa de Node)*.
 
 ### 2. Claude Code (CLI)
 
 ```bash
-claude mcp add uca -- npx -y uca-mcp
+claude mcp add uca -- uca-mcp serve
 ```
 
 ### 3. Gemini CLI
 
 ```bash
-gemini mcp add uca npx -y uca-mcp
+gemini mcp add uca uca-mcp serve
 ```
 
 ### 4. Cursor (`~/.cursor/mcp.json` o en tu proyecto `.cursor/mcp.json`)
@@ -98,7 +98,7 @@ gemini mcp add uca npx -y uca-mcp
   }
 }
 ```
-*(O con `"command": "npx"` y `"args": ["-y", "uca-mcp", "serve"]` si preferís no instalarlo de forma global)*.
+*(O ejecutá `uca-mcp setup cursor` para configurarlo de forma automática)*.
 
 ### 5. VS Code (`.vscode/mcp.json`)
 
@@ -107,8 +107,8 @@ gemini mcp add uca npx -y uca-mcp
   "servers": {
     "uca": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "uca-mcp"]
+      "command": "uca-mcp",
+      "args": ["serve"]
     }
   }
 }
@@ -117,7 +117,7 @@ gemini mcp add uca npx -y uca-mcp
 ### 6. OpenAI Codex / Asistentes CLI compatibles con MCP
 
 ```bash
-codex mcp add uca -- npx -y uca-mcp
+codex mcp add uca -- uca-mcp serve
 ```
 
 ### 7. Asistente Automático CLI
@@ -125,9 +125,9 @@ codex mcp add uca -- npx -y uca-mcp
 Podés ejecutar el asistente interactivo para que configure automáticamente los archivos de tu cliente:
 
 ```bash
-npx -y uca-mcp setup claude
-npx -y uca-mcp setup cursor
-npx -y uca-mcp setup vscode
+uca-mcp setup claude
+uca-mcp setup cursor
+uca-mcp setup vscode
 ```
 
 > [!NOTE]

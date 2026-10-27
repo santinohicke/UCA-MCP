@@ -157,21 +157,15 @@ Comandos:
     const targetClient = (positionals[1] || "all").toLowerCase();
     console.log(`Configurando UCA MCP para: ${targetClient}...`);
 
-    const isNpx = __dirname.includes("_npx") || __dirname.includes("npm-cache");
     let mcpEntry: { command: string; args: string[] };
+    const isNpx = __dirname.includes("_npx") || __dirname.includes("npm-cache");
 
     if (isNpx) {
-      if (process.platform === "win32") {
-        mcpEntry = {
-          command: "cmd.exe",
-          args: ["/c", "npx", "-y", `uca-mcp@${CONFIG.VERSION}`, "serve"]
-        };
-      } else {
-        mcpEntry = {
-          command: "npx",
-          args: ["-y", `uca-mcp@${CONFIG.VERSION}`, "serve"]
-        };
-      }
+      mcpEntry = {
+        command: "uca-mcp",
+        args: ["serve"]
+      };
+      console.log("[INFO] Configurado con comando global 'uca-mcp'. Recordá tenerlo instalado con: npm install -g uca-mcp");
     } else {
       const entryScript = path.resolve(__dirname, "cli.js");
       mcpEntry = {
