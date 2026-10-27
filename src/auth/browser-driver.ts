@@ -200,10 +200,10 @@ export async function silentRefreshGuarani(): Promise<boolean> {
           }
         } catch {}
 
-        // 2. Navegar a guarani-gestion para emitir el ticket de Guaraní en el iframe
-        await page.goto("https://autogestion.uca.edu.ar/guarani-gestion", {
+        // 2. Navegar a /guarani para emitir el ticket de Guaraní y redirigir directamente
+        await page.goto("https://autogestion.uca.edu.ar/guarani", {
           timeout: 25000,
-          waitUntil: "networkidle"
+          waitUntil: "domcontentloaded"
         });
 
         let siuSession: string | undefined;
@@ -564,27 +564,20 @@ async function executeInteractiveLogin(): Promise<void> {
                 console.log("Sincronizando sesión en SIU Guaraní vía Autogestión...");
                 const guaraniPage = await context.newPage();
 
-                // 1. Visitar autogestión para inicializar SSO y cookie de sesión del campus
-                await guaraniPage.goto("https://autogestion.uca.edu.ar/", {
+                // 1. Visitar /login en Autogestión para inicializar SSO y sesión del campus
+                await guaraniPage.goto("https://autogestion.uca.edu.ar/login", {
                   timeout: 25000,
                   waitUntil: "domcontentloaded"
-                });
-                for (let i = 0; i < 5; i++) {
-                  const u = guaraniPage.url();
-                  if (u.includes("microsoftonline.com") || u.includes("saml")) {
-                    await new Promise((r) => setTimeout(r, 1000));
-                  } else {
-                    break;
-                  }
-                }
+                }).catch(() => {});
 
-                // 2. Navegar a guarani-gestion para emitir el ticket de Guaraní en el iframe
-                await guaraniPage.goto("https://autogestion.uca.edu.ar/guarani-gestion", {
+                // 2. Navegar directamente a /guarani para emitir el ticket de Guaraní
+                // Este endpoint redirige de forma directa a https://guarani.uca.edu.ar/academicos/inicio_alumno
+                await guaraniPage.goto("https://autogestion.uca.edu.ar/guarani", {
                   timeout: 25000,
-                  waitUntil: "networkidle"
-                });
+                  waitUntil: "domcontentloaded"
+                }).catch(() => {});
 
-                // 3. Esperar que el iframe de Guaraní y su cookie estén disponibles (hasta 10s)
+                // 3. Esperar que la redirección a Guaraní se complete y se emita la cookie
                 for (let i = 0; i < 10; i++) {
                   const cookies = await context.cookies();
                   const siuCookie = cookies.find((c) => c.name.startsWith("siu_sess"));
@@ -595,15 +588,9 @@ async function executeInteractiveLogin(): Promise<void> {
                   await new Promise((r) => setTimeout(r, 1000));
                 }
 
-                // 4. Descartar propuestas auxiliares y seleccionar carrera real si el frame está listo
-                let guaraniFrame = guaraniPage.frames().find((f) => f.url().includes("guarani.uca.edu.ar"));
-                for (let i = 0; i < 5 && !guaraniFrame; i++) {
-                  await new Promise((r) => setTimeout(r, 1000));
-                  guaraniFrame = guaraniPage.frames().find((f) => f.url().includes("guarani.uca.edu.ar"));
-                }
-
-                if (guaraniFrame) {
-                  const carrerasInfo = await guaraniFrame
+                // 4. Descartar propuestas auxiliares y seleccionar carrera real directamente en la página
+                try {
+                  const carrerasInfo = await guaraniPage
                     .evaluate(() => {
                       const NON_DEGREE = /tutor|ingreso|bachiller/i;
                       const links = Array.from(
@@ -625,7 +612,7 @@ async function executeInteractiveLogin(): Promise<void> {
                     })
                     .catch(() => null);
 
-                  if (carrerasInfo) {
+                  if (carrerasInfo && carrerasInfo.all.length > 0) {
                     carrerasDisponibles = carrerasInfo.validas.length > 0 ? carrerasInfo.validas : carrerasInfo.all;
                     if (carrerasInfo.validas.length === 1) {
                       carreraActiva = carrerasInfo.validas[0].nombre;
@@ -637,7 +624,7 @@ async function executeInteractiveLogin(): Promise<void> {
                     }
                   }
                   await new Promise((r) => setTimeout(r, 1500));
-                }
+                } catch {}
 
                 // 5. Verificación final de cookie siu_sess
                 if (!siuSession) {

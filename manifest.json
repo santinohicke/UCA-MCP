@@ -2,7 +2,7 @@
   "manifest_version": "0.1",
   "name": "uca-mcp",
   "display_name": "UCA MCP - Asistente Académico",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Conectá EVA Moodle, SIU Guaraní y Campus Autogestión con Claude sin usar la terminal.",
   "author": {
     "name": "Comunidad Estudiantil UCA"
