@@ -2,14 +2,18 @@
   "manifest_version": "0.1",
   "name": "uca-mcp",
   "display_name": "UCA MCP - Asistente Académico",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Conectá EVA Moodle, SIU Guaraní y Campus Autogestión con Claude sin usar la terminal.",
   "author": {
     "name": "Comunidad Estudiantil UCA"
   },
   "homepage": "https://github.com/santinohicke/uca-mcp",
   "compatibility": {
-    "platforms": ["win32", "darwin", "linux"],
+    "platforms": [
+      "win32",
+      "darwin",
+      "linux"
+    ],
     "runtimes": {
       "node": ">=20.18.1"
     }
@@ -27,30 +31,86 @@
     "entry_point": "build/src/index.js",
     "mcp_config": {
       "command": "node",
-      "args": ["${__dirname}/build/src/index.js"],
+      "args": [
+        "${__dirname}/build/src/index.js"
+      ],
       "env": {
         "UCA_HABILITAR_ESCRITURA": "${user_config.habilitar_escritura}"
       }
     }
   },
   "tools": [
-    { "name": "uca_diagnosticar_sistema", "description": "Audita conectividad, estado de sesión cifrada, validez del entorno gráfico y rutas de almacenamiento." },
-    { "name": "uca_iniciar_sesion", "description": "Inicia el flujo de autenticación institucional abriendo el navegador en Microsoft Entra ID." },
-    { "name": "uca_resumen_semanal", "description": "Trae en paralelo agenda, tareas próximas de EVA, avisos de cátedra e inasistencias de Guaraní." },
-    { "name": "eva_materias", "description": "Lista las aulas virtuales y materias matriculadas en EVA Moodle con sus identificadores de curso." },
-    { "name": "eva_contenido_curso", "description": "Lista las secciones, módulos, tareas y recursos pertenecientes a un curso en EVA." },
-    { "name": "eva_tareas_y_notas", "description": "Obtiene tareas, plazos de entrega, estado de entregas y fechas límite en EVA Moodle." },
-    { "name": "eva_foros", "description": "Obtiene los últimos avisos institucionales y mensajes de foros de cátedra." },
-    { "name": "eva_buscar_materiales", "description": "Busca recursos, consignas y documentos en EVA por palabra clave." },
-    { "name": "eva_leer_archivo", "description": "Descarga de forma segura y extrae texto de PDFs y Office, o retorna imágenes de páginas escaneadas." },
-    { "name": "eva_guardar_borrador_tarea", "description": "[EXPERIMENTAL] Sube un archivo o texto a EVA Moodle en modo borrador editable (Canal B)." },
-    { "name": "eva_responder_foro", "description": "Publica una respuesta en un foro de cátedra de EVA Moodle (Canal B)." },
-    { "name": "guarani_estado_cursada", "description": "Detalla cursadas activas, horarios, regularidad e inasistencias acumuladas en SIU Guaraní." },
-    { "name": "guarani_historia_academica", "description": "Analítico completo: finales aprobados, materias pendientes, notas y promedios en SIU Guaraní." },
-    { "name": "guarani_mesas_disponibles", "description": "[EXPERIMENTAL] Mesas de examen final con fechas, turnos, tribunales y condición de inscripción en SIU Guaraní." },
-    { "name": "guarani_correlatividades_y_plan", "description": "Consulta el plan de estudios interactivo, materias por año, estado de aprobación y correlatividades para cursar y rendir final." },
-    { "name": "guarani_inscribir_examen", "description": "[EXPERIMENTAL - DESACTIVADA] Inscribe formalmente a un examen final en SIU Guaraní mediante ciclo en dos fases (Canal B)." },
-    { "name": "guarani_certificado_alumno_regular", "description": "Emite y descarga formalmente en PDF la Constancia de Alumno Regular (o de actividades aprobadas/promedio) con código de validación institucional desde SIU Guaraní (Canal B)." },
-    { "name": "campus_aranceles_y_tramites", "description": "[EXPERIMENTAL] Consulta aranceles al día/pendientes y estado de trámites administrativos en Campus Autogestión." }
+    {
+      "name": "uca_diagnosticar_sistema",
+      "description": "Audita conectividad, estado de sesión cifrada, validez del entorno gráfico y rutas de almacenamiento."
+    },
+    {
+      "name": "uca_iniciar_sesion",
+      "description": "Inicia el flujo de autenticación institucional abriendo el navegador en Microsoft Entra ID."
+    },
+    {
+      "name": "uca_resumen_semanal",
+      "description": "Trae en paralelo agenda, tareas próximas de EVA, avisos de cátedra e inasistencias de Guaraní."
+    },
+    {
+      "name": "eva_materias",
+      "description": "Lista las aulas virtuales y materias matriculadas en EVA Moodle con sus identificadores de curso."
+    },
+    {
+      "name": "eva_contenido_curso",
+      "description": "Lista las secciones, módulos, tareas y recursos pertenecientes a un curso en EVA."
+    },
+    {
+      "name": "eva_tareas_y_notas",
+      "description": "Obtiene tareas, plazos de entrega, estado de entregas y fechas límite en EVA Moodle."
+    },
+    {
+      "name": "eva_foros",
+      "description": "Obtiene los últimos avisos institucionales y mensajes de foros de cátedra."
+    },
+    {
+      "name": "eva_buscar_materiales",
+      "description": "Busca recursos, consignas y documentos en EVA por palabra clave."
+    },
+    {
+      "name": "eva_leer_archivo",
+      "description": "Descarga de forma segura y extrae texto de PDFs y Office, o retorna imágenes de páginas escaneadas."
+    },
+    {
+      "name": "eva_guardar_borrador_tarea",
+      "description": "[EXPERIMENTAL] Sube un archivo o texto a EVA Moodle en modo borrador editable (Canal B)."
+    },
+    {
+      "name": "eva_responder_foro",
+      "description": "Publica una respuesta en un foro de cátedra de EVA Moodle (Canal B)."
+    },
+    {
+      "name": "guarani_estado_cursada",
+      "description": "Detalla cursadas activas, horarios, regularidad e inasistencias acumuladas en SIU Guaraní."
+    },
+    {
+      "name": "guarani_historia_academica",
+      "description": "Analítico completo: finales aprobados, materias pendientes, notas y promedios en SIU Guaraní."
+    },
+    {
+      "name": "guarani_mesas_disponibles",
+      "description": "[EXPERIMENTAL] Mesas de examen final con fechas, turnos, tribunales y condición de inscripción en SIU Guaraní."
+    },
+    {
+      "name": "guarani_correlatividades_y_plan",
+      "description": "Consulta el plan de estudios interactivo, materias por año, estado de aprobación y correlatividades para cursar y rendir final."
+    },
+    {
+      "name": "guarani_inscribir_examen",
+      "description": "[EXPERIMENTAL - DESACTIVADA] Inscribe formalmente a un examen final en SIU Guaraní mediante ciclo en dos fases (Canal B)."
+    },
+    {
+      "name": "guarani_certificado_alumno_regular",
+      "description": "Emite y descarga formalmente en PDF la Constancia de Alumno Regular (o de actividades aprobadas/promedio) con código de validación institucional desde SIU Guaraní (Canal B)."
+    },
+    {
+      "name": "campus_aranceles_y_tramites",
+      "description": "[EXPERIMENTAL] Consulta aranceles al día/pendientes y estado de trámites administrativos en Campus Autogestión."
+    }
   ]
 }

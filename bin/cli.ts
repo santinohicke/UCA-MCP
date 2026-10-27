@@ -157,7 +157,7 @@ Comandos:
     const targetClient = (positionals[1] || "all").toLowerCase();
     console.log(`Configurando UCA MCP para: ${targetClient}...`);
 
-    const isNpx = __dirname.includes("_npx") || __dirname.includes(".npm");
+    const isNpx = __dirname.includes("_npx") || __dirname.includes("npm-cache");
     let mcpEntry: { command: string; args: string[] };
 
     if (isNpx) {

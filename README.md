@@ -23,7 +23,7 @@ Servidor **Model Context Protocol (MCP)** open source para conectar a tus asiste
 
 ### Opción 1: Instalación Sin Terminal con `.mcpb` (Recomendada para Claude Desktop)
 
-1. Descargá el paquete preempaquetado [`uca-mcp-1.0.1.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde los Releases.
+1. Descargá el paquete preempaquetado [`uca-mcp-1.0.3.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde los Releases.
 2. Hacé **doble clic** en el archivo `.mcpb`. Claude Desktop lo reconocerá e instalará de forma nativa sin requerir consola ni comandos.
 3. Abrí un nuevo chat en Claude y escribí:  
    > *"Por favor, iniciá sesión en UCA"*
@@ -31,21 +31,28 @@ Servidor **Model Context Protocol (MCP)** open source para conectar a tus asiste
 
 ---
 
-### Opción 2: Instalación vía Terminal (NPX / CLI)
+### Opción 2: Instalación vía Terminal (NPM / CLI)
 
-Si preferís usar la terminal o tu cliente requiere configuración por comando:
+Si preferís usar la terminal o tu cliente requiere configuración por comando, lo más rápido es instalarlo con npm una sola vez para que responda al instante:
 
-1. **Iniciar Sesión Institucional:**
+1. **Instalar globalmente:**
    ```bash
-   npx -y uca-mcp login
+   npm install -g uca-mcp
+   ```
+
+2. **Iniciar Sesión Institucional:**
+   ```bash
+   uca-mcp login
    ```
    Se abrirá una ventana de tu navegador (Edge, Chrome). Ingresá con tu cuenta `@uca.edu.ar`, aprobá el doble factor (2FA/MFA) en tu celular y marcá **"Mantener la sesión iniciada"**.
    
 3. **Verificar Estado del Entorno:**
    ```bash
-   npx -y uca-mcp doctor
+   uca-mcp doctor
    ```
-   Comprueba versión de Node.js, modo de llavero (Windows/ MacOS / Linux), navegador detectado, herramienta de diálogo nativo y conectividad directa a EVA, SIU Guaraní y Campus.
+   Comprueba versión de Node.js, modo de llavero (Windows / macOS / Linux), navegador detectado, herramienta de diálogo nativo y conectividad directa a EVA, SIU Guaraní y Campus.
+
+*(También podés correrlo directamente sin instalar ejecutando `npx -y uca-mcp <comando>`, aunque en Windows `npx` agrega demoras de red en cada arranque).*
 
 ---
 
@@ -59,8 +66,8 @@ Si no usás el archivo `.mcpb`, agregalo a tu `claude_desktop_config.json`:
 {
   "mcpServers": {
     "uca": {
-      "command": "npx",
-      "args": ["-y", "uca-mcp"]
+      "command": "uca-mcp",
+      "args": ["serve"]
     }
   }
 }
@@ -85,12 +92,13 @@ gemini mcp add uca npx -y uca-mcp
 {
   "mcpServers": {
     "uca": {
-      "command": "npx",
-      "args": ["-y", "uca-mcp"]
+      "command": "uca-mcp",
+      "args": ["serve"]
     }
   }
 }
 ```
+*(O con `"command": "npx"` y `"args": ["-y", "uca-mcp", "serve"]` si preferís no instalarlo de forma global)*.
 
 ### 5. VS Code (`.vscode/mcp.json`)
 
