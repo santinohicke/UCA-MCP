@@ -4,28 +4,37 @@
 [![Licencia](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-purple.svg)](https://modelcontextprotocol.io)
 
-Servidor de código abierto que implementa el **Model Context Protocol (MCP)** para conectar asistentes de IA (Claude Desktop, Codex, Cursor, VS Code, Gemini, etc.) de forma segura y directa con las plataformas institucionales de la **Universidad Católica Argentina**:
-- **EVA UCA** (`eva.uca.edu.ar`)
-- **SIU Guaraní** (`guarani.uca.edu.ar`)
-- **Campus Autogestión** (`autogestion.uca.edu.ar`)
+Servidor de código abierto desarrollado por la comunidad estudiantil que implementa el **Model Context Protocol (MCP)** para conectar a tus asistentes de IA favoritos (Claude Desktop, Cursor, VS Code, Gemini, etc.) de forma segura y directa con las plataformas institucionales de la **Universidad Católica Argentina**:
+- **EVA UCA** (`eva.uca.edu.ar` — Moodle 4.5)
+- **SIU Guaraní 3** (`guarani.uca.edu.ar` — Chulupi / Kernel)
+- **Campus Autogestión** (`autogestion.uca.edu.ar` — Next.js / Trámites)
 
 ---
 
+## ⚠️ Aviso Legal y de Privacidad
+
+> **PROYECTO ESTUDIANTIL INDEPENDIENTE Y NO OFICIAL**  
+> Este desarrollo es una herramienta creada por y para la comunidad estudiantil de la UCA y **no cuenta con patrocinio, aval, asociación ni relación formal con las autoridades de la Pontificia Universidad Católica Argentina**.  
 >  
 > **Privacidad y Tratamiento de Datos:**  
 > - **Zero-Telemetry Propia:** El software no posee servidores intermediarios, proxies externos ni telemetría; opera 100% de manera local en tu computadora.  
 > - **Tratamiento por el Proveedor de IA:** La información académica y personal consultada (analíticos, calificaciones, estado de cuotas, mensajes de foros y consignas) se transmite directamente como resultado de herramienta (`tool output`) al modelo de IA configurado en tu cliente (Anthropic Claude, OpenAI, Google, Cursor, etc.). Su almacenamiento, retención y privacidad quedan sujetos a los términos del proveedor de dicho LLM.  
-> - Las credenciales y sesiones se cifran localmente en tu computadora y se resguardan en el **Llavero nativo del Sistema Operativo** (Windows DPAPI, macOS Keychain, Linux Secret Service).  
+> - Las credenciales y sesiones se cifran localmente en tu computadora con **AES-256-GCM** y se resguardan en el **Llavero nativo del Sistema Operativo** (Windows DPAPI, macOS Keychain, Linux Secret Service).  
 > - Ninguna contraseña se guarda en texto plano ni se expone al modelo de inteligencia artificial.  
-> - Todas las subidas (entregas de trabajos, respuestas a foros o inscripciones) están protegidas por un diálogo modal nativo del sistema operativo o formulario interactivo que exige confirmación explícita del usuario (**Canal B / Elicitation**).
+> - Todas las mutaciones (subida de borradores, respuestas a foros o inscripciones) están protegidas por **Canal B / Elicitation** (un diálogo modal nativo del sistema operativo o formulario interactivo que exige confirmación física explícita).  
+> - **Términos de Servicio y Responsabilidad:** El uso de este software corre bajo exclusiva responsabilidad del usuario. La automatización de plataformas institucionales puede estar sujeta a políticas de uso aceptable o términos de servicio (ToS) de la universidad.
 
 ---
 
-## Inicio Rápido
+## 🚀 Inicio Rápido (Quickstart)
+
+> [!WARNING]
+> **Límite de seguridad importante sobre agentes con acceso a shell:**  
+> Las confirmaciones físicas de Canal B (diálogos modales nativos del SO) y MCP Elicitation protegen contra inyecciones de prompt y ejecuciones de herramientas no autorizadas dentro de la conversación del chat. **Canal B no protege contra un agente de IA que cuente con permisos de shell o ejecución de comandos (terminal/bash/PowerShell) bajo tu mismo usuario del sistema operativo**, ya que dicho agente tiene acceso directo a tu sistema de archivos local y al almacenamiento de sesiones (`%LOCALAPPDATA%\uca-mcp` en Windows, `~/Library/Application Support/uca-mcp` en macOS, o `~/.local/state/uca-mcp` en Linux). Si usás agentes autónomos con terminal, ejecútalos en contenedores o perfiles de usuario aislados.
 
 ### Opción 1: Instalación Sin Terminal con `.mcpb` (Recomendada para Claude Desktop)
 
-1. Descargá el paquete preempaquetado [`uca-mcp-1.0.0.mcpb`](https://github.com/santinohicke/uca-mcp/releases) desde los Releases.
+1. Descargá el paquete preempaquetado [`uca-mcp-1.0.1.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde los Releases.
 2. Hacé **doble clic** en el archivo `.mcpb`. Claude Desktop lo reconocerá e instalará de forma nativa sin requerir consola ni comandos.
 3. Abrí un nuevo chat en Claude y escribí:  
    > *"Por favor, iniciá sesión en UCA"* o *"Abrí el login institucional de UCA"*
@@ -35,21 +44,23 @@ Servidor de código abierto que implementa el **Model Context Protocol (MCP)** p
 
 ### Opción 2: Instalación vía Terminal (NPX / CLI)
 
+Si preferís usar la terminal o tu cliente requiere configuración por comando:
+
 1. **Iniciar Sesión Institucional:**
    ```bash
-   npx -y uca-mcp@1.0.0 login
+   npx -y uca-mcp login
    ```
-   Se abrirá una ventana de tu navegador (Edge, Chrome). Ingresá con tu cuenta `@uca.edu.ar`, aprobá el doble factor (2FA/MFA) en tu celular y marcá **"Mantener la sesión iniciada"**. Al detectar la sesión, tus cookies y tokens se cifrarán automáticamente en tu disco local.
+   Se abrirá una ventana de tu navegador (Edge, Chrome o Chromium). Ingresá con tu cuenta `@uca.edu.ar`, aprobá el doble factor (2FA/MFA) en tu celular y marcá **"Mantener la sesión iniciada"**. Al detectar la sesión, tus cookies y tokens se cifrarán automáticamente en tu disco local.
 
 2. **Verificar Estado del Entorno:**
    ```bash
-   npx -y uca-mcp@1.0.0 doctor
+   npx -y uca-mcp doctor
    ```
-   Comprueba versión de Node.js, modo de llavero (DPAPI/Keychain/Secret Service), navegador detectado, herramienta de diálogo nativo y conectividad directa a EVA, SIU Guaraní y Campus.
+   Comprueba versión de Node.js, modo de llavero (DPAPI/Keychain/Secret Service), navegador detectado, herramienta de diálogo nativo y conectividad directa a EVA, Guaraní y Campus.
 
 ---
 
-## Configuración por Cliente
+## 🔌 Configuración por Cliente
 
 ### 1. Claude Desktop (Configuración Manual JSON)
 
@@ -60,23 +71,23 @@ Si no usás el archivo `.mcpb`, agregalo a tu `claude_desktop_config.json`:
   "mcpServers": {
     "uca": {
       "command": "npx",
-      "args": ["-y", "uca-mcp@1.0.0"]
+      "args": ["-y", "uca-mcp"]
     }
   }
 }
 ```
-*(En Windows, si la interfaz de Claude no hereda el PATH de Node.js, podés especificar `"command": "cmd.exe"` y `"args": ["/c", "npx", "-y", "uca-mcp@1.0.0"]`)*.
+*(En Windows, si la interfaz de Claude no hereda el PATH de Node.js, podés especificar `"command": "cmd.exe"` y `"args": ["/c", "npx", "-y", "uca-mcp"]`)*.
 
 ### 2. Claude Code (CLI)
 
 ```bash
-claude mcp add uca -- npx -y uca-mcp@1.0.0
+claude mcp add uca -- npx -y uca-mcp
 ```
 
 ### 3. Gemini CLI
 
 ```bash
-gemini mcp add uca npx -y uca-mcp@1.0.0
+gemini mcp add uca npx -y uca-mcp
 ```
 
 ### 4. Cursor (`~/.cursor/mcp.json` o en tu proyecto `.cursor/mcp.json`)
@@ -86,7 +97,7 @@ gemini mcp add uca npx -y uca-mcp@1.0.0
   "mcpServers": {
     "uca": {
       "command": "npx",
-      "args": ["-y", "uca-mcp@1.0.0"]
+      "args": ["-y", "uca-mcp"]
     }
   }
 }
@@ -100,7 +111,7 @@ gemini mcp add uca npx -y uca-mcp@1.0.0
     "uca": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "uca-mcp@1.0.0"]
+      "args": ["-y", "uca-mcp"]
     }
   }
 }
@@ -109,7 +120,7 @@ gemini mcp add uca npx -y uca-mcp@1.0.0
 ### 6. OpenAI Codex / Asistentes CLI compatibles con MCP
 
 ```bash
-codex mcp add uca -- npx -y uca-mcp@1.0.0
+codex mcp add uca -- npx -y uca-mcp
 ```
 
 ### 7. Asistente Automático CLI
@@ -117,18 +128,30 @@ codex mcp add uca -- npx -y uca-mcp@1.0.0
 Podés ejecutar el asistente interactivo para que configure automáticamente los archivos de tu cliente:
 
 ```bash
-npx -y uca-mcp@1.0.0 setup claude
-npx -y uca-mcp@1.0.0 setup cursor
-npx -y uca-mcp@1.0.0 setup vscode
+npx -y uca-mcp setup claude
+npx -y uca-mcp setup cursor
+npx -y uca-mcp setup vscode
 ```
 
+> [!TIP]
+> **Habilitación de Herramientas de Escritura (Mutaciones):**
+> En el paquete de escritorio `.mcpb` (Claude Desktop), las herramientas de escritura vienen habilitadas por defecto (`"default": true` en `manifest.json`), dado que toda acción de mutación está protegida de forma no negociable por la confirmación física en ventana modal de **Canal B**.
+> Al ejecutar el servidor vía consola CLI o configuración manual STDIO, las 14 herramientas de solo lectura están habilitadas y las 4 herramientas de escritura (`eva_guardar_borrador_tarea`, `eva_responder_foro`, `guarani_certificado_alumno_regular` y `guarani_inscribir_examen`) están desactivadas por defecto (`UCA_HABILITAR_ESCRITURA=false`). Para activarlas en CLI o JSON manual, definí la variable en la clave `"env"` de tu cliente o ejecutá con:
+> ```json
+> "env": {
+>   "UCA_HABILITAR_ESCRITURA": "true"
+> }
+> ```
+> O en terminal: `UCA_HABILITAR_ESCRITURA=true npx -y uca-mcp serve`
+>
+> *Nota sobre inscripción a exámenes finales:* `guarani_inscribir_examen` cuenta con una salvaguarda adicional y requiere definir `UCA_HABILITAR_INSCRIPCION_FINAL=true` de forma explícita.
 
 > [!NOTE]
 > **Transporte Exclusivo STDIO Local:** Este servidor implementa comunicación local mediante el estándar `stdio` para ejecutarse en tu propia máquina junto a tu cliente MCP de escritorio. En esta versión (v1), **no cuenta con transporte HTTP/SSE remoto**, por lo que **no es compatible directamente con ChatGPT Web ni aplicaciones móviles** sin un túnel MCP local autogestionado.
 
 ---
 
-## Herramientas MCP (14 por defecto, 18 con escritura)
+## 🛠️ Catálogo de Herramientas MCP (14 por defecto, 18 con escritura)
 
 | Herramienta | Plataforma | Tipo | Descripción |
 | :--- | :--- | :--- | :--- |
@@ -141,19 +164,19 @@ npx -y uca-mcp@1.0.0 setup vscode
 | `eva_foros` | EVA | Lectura | Obtiene avisos de cátedra y discusiones recientes (con aviso de contenido no confiable). |
 | `eva_buscar_materiales` | EVA | Lectura | Busca recursos y consignas por palabra clave en todas tus aulas. |
 | `eva_leer_archivo` | EVA | Lectura | Descarga y extrae texto de PDFs y Office (.docx/.xlsx/.pptx) con allowlist estricta HTTPS y anti zip-bombs. |
-| `eva_guardar_borrador_tarea` | EVA | Mutación | Sube un borrador editable de entrega tras validación y **aprobación física en Canal B**. |
+| `eva_guardar_borrador_tarea` | EVA | Mutación | [EXPERIMENTAL] Sube un borrador editable de entrega tras validación y **aprobación física en Canal B**. |
 | `eva_responder_foro` | EVA | Mutación | Publica una respuesta en un foro mostrando el texto completo tras **aprobación en Canal B**. |
 | `guarani_estado_cursada` | SIU Guaraní | Lectura | Horarios, asistencias acumuladas, porcentaje de faltas y predictor de regularidad de cursadas activas. |
 | `guarani_historia_academica`| SIU Guaraní | Lectura | Analítico completo: finales aprobados, materias regulares, libro, folio y promedios. |
-| `guarani_mesas_disponibles` | SIU Guaraní | Lectura | Mesas de examen final con fechas, turnos, tribunales y estado de inscripción. |
+| `guarani_mesas_disponibles` | SIU Guaraní | Lectura | [EXPERIMENTAL] Mesas de examen final con fechas, turnos, tribunales y estado de inscripción. |
 | `guarani_correlatividades_y_plan` | SIU Guaraní | Lectura | Plan interactivo, materias por año, correlativas para cursar/rendir e impacto a futuro. |
 | `guarani_certificado_alumno_regular` | SIU Guaraní | Mutación | Emite y descarga formalmente en PDF la Constancia de Alumno Regular (o aprobadas/promedio) con código de validación institucional tras **aprobación en Canal B**. |
-| `guarani_inscribir_examen` | SIU Guaraní | Mutación | Ciclo atómico en 2 fases con confirmación física en Canal B. **Nota:** La baja de examen no está disponible vía MCP (v1) y debe realizarse en [SIU Guaraní](https://guarani.uca.edu.ar). |
-| `campus_aranceles_y_tramites`| Campus | Lectura | Consulta de cuotas al día/pendientes y estado de trámites administrativos (estricto read-only). |
+| `guarani_inscribir_examen` | SIU Guaraní | Mutación | [EXPERIMENTAL - DESACTIVADA] Ciclo atómico en 2 fases con confirmación física en Canal B. **Nota:** La baja de examen no está disponible vía MCP (v1) y debe realizarse en [SIU Guaraní](https://guarani.uca.edu.ar). |
+| `campus_aranceles_y_tramites`| Campus | Lectura | [EXPERIMENTAL] Consulta de cuotas al día/pendientes y estado de trámites administrativos (estricto read-only). |
 
 ---
 
-## Seguridad y Arquitectura
+## 🔒 Seguridad y Arquitectura
 
 1. **Blindaje de STDOUT (`src/silence-stdout.ts`)**: Todo log, advertencia o salida de procesos secundarios se redirige a `stderr`. El transporte JSON-RPC corre exclusivamente sobre `mcpStdoutStream`, garantizando que la trama no se corrompa jamás.
 2. **Canal B Independiente y Elicitation**: Las acciones de mutación no pueden ser auto-aprobadas por el LLM ni por inyecciones de prompt. Se despliega una ventana modal nativa del sistema operativo (`WScript.Shell.Popup` en Windows, `osascript` en macOS, `zenity` / `kdialog` / `yad` en Linux) con botón *Cancelar* por defecto y timeout de 45 segundos (fail-closed). En entornos headless o donde las ventanas nativas no estén disponibles, conmuta de forma transparente a Canal A (formulario interactivo MCP Elicitation) sin falsos rechazos de usuario.
@@ -165,10 +188,6 @@ npx -y uca-mcp@1.0.0 setup vscode
 5. **Modelo de Amenazas y Límites de Seguridad del Sistema Operativo**:
    - Canal B y Elicitation previenen inyecciones de prompt indirectas, escalamiento de contexto o ejecución autónoma no autorizada de herramientas por parte del LLM.
    - **Límites de aislamiento del host:** Si un agente de IA o proceso secundario posee permisos de shell o ejecución arbitraria de comandos en el sistema operativo bajo la misma cuenta de usuario (mismo UID/SID), dicho proceso tiene acceso nativo al sistema de archivos local y podría leer las cookies de sesión, el llavero o los perfiles de navegador. Se recomienda ejecutar agentes con acceso a shell en entornos aislados o contenedores.
-
----
-
-Esta herramienta fue creada para la comunidad estudiantil de la UCA y **no es oficial de la Pontificia Universidad Católica Argentina**.  
 
 ---
 

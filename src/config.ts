@@ -25,7 +25,7 @@ function getPackageVersion(): string {
       if (pkg.version) return pkg.version;
     }
   } catch {}
-  return "1.0.0";
+  return "1.0.1";
 }
 
 const PACKAGE_VERSION = getPackageVersion();

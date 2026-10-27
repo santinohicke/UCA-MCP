@@ -563,13 +563,45 @@ async function executeInteractiveLogin(): Promise<void> {
               try {
                 console.log("Sincronizando sesión en SIU Guaraní vía Autogestión...");
                 const guaraniPage = await context.newPage();
+
+                // 1. Visitar autogestión para inicializar SSO y cookie de sesión del campus
+                await guaraniPage.goto("https://autogestion.uca.edu.ar/", {
+                  timeout: 25000,
+                  waitUntil: "domcontentloaded"
+                });
+                for (let i = 0; i < 5; i++) {
+                  const u = guaraniPage.url();
+                  if (u.includes("microsoftonline.com") || u.includes("saml")) {
+                    await new Promise((r) => setTimeout(r, 1000));
+                  } else {
+                    break;
+                  }
+                }
+
+                // 2. Navegar a guarani-gestion para emitir el ticket de Guaraní en el iframe
                 await guaraniPage.goto("https://autogestion.uca.edu.ar/guarani-gestion", {
                   timeout: 25000,
                   waitUntil: "networkidle"
                 });
 
-                // Descartar propuestas auxiliares y seleccionar carrera real
-                const guaraniFrame = guaraniPage.frames().find((f) => f.url().includes("guarani.uca.edu.ar"));
+                // 3. Esperar que el iframe de Guaraní y su cookie estén disponibles (hasta 10s)
+                for (let i = 0; i < 10; i++) {
+                  const cookies = await context.cookies();
+                  const siuCookie = cookies.find((c) => c.name.startsWith("siu_sess"));
+                  if (siuCookie) {
+                    siuSession = siuCookie.value;
+                    break;
+                  }
+                  await new Promise((r) => setTimeout(r, 1000));
+                }
+
+                // 4. Descartar propuestas auxiliares y seleccionar carrera real si el frame está listo
+                let guaraniFrame = guaraniPage.frames().find((f) => f.url().includes("guarani.uca.edu.ar"));
+                for (let i = 0; i < 5 && !guaraniFrame; i++) {
+                  await new Promise((r) => setTimeout(r, 1000));
+                  guaraniFrame = guaraniPage.frames().find((f) => f.url().includes("guarani.uca.edu.ar"));
+                }
+
                 if (guaraniFrame) {
                   const carrerasInfo = await guaraniFrame
                     .evaluate(() => {
@@ -604,19 +636,23 @@ async function executeInteractiveLogin(): Promise<void> {
                       );
                     }
                   }
-                  await new Promise((r) => setTimeout(r, 2000));
+                  await new Promise((r) => setTimeout(r, 1500));
                 }
 
-                const allCookies = await context.cookies();
-                const siuCookie = allCookies.find((c) => c.name.startsWith("siu_sess"));
-                if (siuCookie) {
-                  siuSession = siuCookie.value;
+                // 5. Verificación final de cookie siu_sess
+                if (!siuSession) {
+                  const allCookies = await context.cookies();
+                  const siuCookie = allCookies.find((c) => c.name.startsWith("siu_sess"));
+                  if (siuCookie) siuSession = siuCookie.value;
+                }
+
+                if (siuSession) {
                   console.log("¡Sesión en SIU Guaraní vinculada con éxito!");
                 } else {
                   console.warn("[AVISO] No se detectó cookie siu_sess en Autogestión.");
                 }
 
-                const campusCookie = allCookies.find(
+                const campusCookie = (await context.cookies()).find(
                   (c) => c.name === "uca_campus_autogestion_session" || c.name.includes("campus_autogestion")
                 );
                 campusSession = campusCookie ? campusCookie.value : undefined;
