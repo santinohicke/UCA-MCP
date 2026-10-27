@@ -141,15 +141,15 @@ npx -y uca-mcp@1.0.0 setup vscode
 | `eva_foros` | EVA | Lectura | Obtiene avisos de cátedra y discusiones recientes (con aviso de contenido no confiable). |
 | `eva_buscar_materiales` | EVA | Lectura | Busca recursos y consignas por palabra clave en todas tus aulas. |
 | `eva_leer_archivo` | EVA | Lectura | Descarga y extrae texto de PDFs y Office (.docx/.xlsx/.pptx) con allowlist estricta HTTPS y anti zip-bombs. |
-| `eva_guardar_borrador_tarea` | EVA | Mutación | [EXPERIMENTAL] Sube un borrador editable de entrega tras validación y **aprobación física en Canal B**. |
+| `eva_guardar_borrador_tarea` | EVA | Mutación | Sube un borrador editable de entrega tras validación y **aprobación física en Canal B**. |
 | `eva_responder_foro` | EVA | Mutación | Publica una respuesta en un foro mostrando el texto completo tras **aprobación en Canal B**. |
 | `guarani_estado_cursada` | SIU Guaraní | Lectura | Horarios, asistencias acumuladas, porcentaje de faltas y predictor de regularidad de cursadas activas. |
 | `guarani_historia_academica`| SIU Guaraní | Lectura | Analítico completo: finales aprobados, materias regulares, libro, folio y promedios. |
-| `guarani_mesas_disponibles` | SIU Guaraní | Lectura | [EXPERIMENTAL] Mesas de examen final con fechas, turnos, tribunales y estado de inscripción. |
+| `guarani_mesas_disponibles` | SIU Guaraní | Lectura | Mesas de examen final con fechas, turnos, tribunales y estado de inscripción. |
 | `guarani_correlatividades_y_plan` | SIU Guaraní | Lectura | Plan interactivo, materias por año, correlativas para cursar/rendir e impacto a futuro. |
 | `guarani_certificado_alumno_regular` | SIU Guaraní | Mutación | Emite y descarga formalmente en PDF la Constancia de Alumno Regular (o aprobadas/promedio) con código de validación institucional tras **aprobación en Canal B**. |
-| `guarani_inscribir_examen` | SIU Guaraní | Mutación | [EXPERIMENTAL - DESACTIVADA] Ciclo atómico en 2 fases con confirmación física en Canal B. **Nota:** La baja de examen no está disponible vía MCP (v1) y debe realizarse en [SIU Guaraní](https://guarani.uca.edu.ar). |
-| `campus_aranceles_y_tramites`| Campus | Lectura | [EXPERIMENTAL] Consulta de cuotas al día/pendientes y estado de trámites administrativos (estricto read-only). |
+| `guarani_inscribir_examen` | SIU Guaraní | Mutación | Ciclo atómico en 2 fases con confirmación física en Canal B. **Nota:** La baja de examen no está disponible vía MCP (v1) y debe realizarse en [SIU Guaraní](https://guarani.uca.edu.ar). |
+| `campus_aranceles_y_tramites`| Campus | Lectura | Consulta de cuotas al día/pendientes y estado de trámites administrativos (estricto read-only). |
 
 ---
 
