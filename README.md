@@ -26,7 +26,7 @@ Servidor **Model Context Protocol (MCP)** open source para conectar a tus asiste
 1. Descargá el paquete preempaquetado [`uca-mcp-1.0.3.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde los Releases.
 2. Entra a **Configuración -> Extensiones** y arrastrá el archivo `.mcpb`. Claude Desktop te dejará instalarlo sin requerir consola ni comandos.
 3. Abrí un nuevo chat en Claude y escribí:  
-   > *"Por favor, iniciá sesión en UCA"*
+   > *"Iniciá sesión en UCA"*
 4. Claude abrirá una ventana de navegador para que completes tus credenciales `@uca.edu.ar` y el 2FA. ¡Listo!
 
 ---
