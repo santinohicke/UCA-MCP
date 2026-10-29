@@ -154,12 +154,14 @@ export async function silentRefreshGuarani(): Promise<boolean> {
   guaraniRefreshPromise = (async () => {
     const session = loadEncryptedSession();
     if (!session) return false;
+    const initialSession = loadEncryptedSession();
+    const initialSiu = initialSession?.siuSession;
     let acquired = acquireLock();
     if (!acquired) {
       acquired = await waitForLock(undefined, 10000);
       if (!acquired) {
         const check = loadEncryptedSession();
-        if (check && Date.now() - new Date(check.savedAt).getTime() < 30000) return true;
+        if (check && check.siuSession && check.siuSession !== initialSiu && Date.now() - new Date(check.savedAt).getTime() < 30000) return true;
         return false;
       }
     }
@@ -273,12 +275,14 @@ export async function silentRefreshEva(): Promise<boolean> {
   evaRefreshPromise = (async () => {
     const session = loadEncryptedSession();
     if (!session) return false;
+    const initialSession = loadEncryptedSession();
+    const initialMoodle = initialSession?.moodleSession;
     let acquired = acquireLock();
     if (!acquired) {
       acquired = await waitForLock(undefined, 10000);
       if (!acquired) {
         const check = loadEncryptedSession();
-        if (check && Date.now() - new Date(check.savedAt).getTime() < 30000) return true;
+        if (check && check.moodleSession && check.moodleSession !== initialMoodle && Date.now() - new Date(check.savedAt).getTime() < 30000) return true;
         return false;
       }
     }

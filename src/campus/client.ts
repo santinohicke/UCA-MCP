@@ -32,6 +32,10 @@ export interface CampusInfo {
 export function parseEstadoCuota(raw: string): CuotaInfo["estado"] {
   const s = raw.toLowerCase().trim();
   if (!s) return "Desconocido";
+  // Exclusiones explícitas de "sin deuda" antes de chequear la palabra "deuda"
+  if (s.includes("sin deuda") || s.includes("no adeuda") || s.includes("libre de deuda") || s.includes("al dia") || s.includes("al día")) {
+    return "Pagado";
+  }
   // Casos negativos o de deuda impaga primero para evitar que 'impago' o 'no pagado' coincidan con 'pag'
   if (s.includes("no pag") || s.includes("impag") || s.includes("deuda") || s.includes("a pagar")) {
     return "Pendiente";
@@ -169,9 +173,13 @@ export async function getArancelesYTramites(
           estado: "Al día"
         });
       }
-      result.estadoAranceles = result.aranceles.some((a) => a.estado === "Pendiente" || a.estado === "Vencido")
+      const conDeuda = result.aranceles.some((a) => a.estado === "Pendiente" || a.estado === "Vencido");
+      const hayDesconocidas = result.aranceles.some((a) => a.estado === "Desconocido");
+      result.estadoAranceles = conDeuda
         ? "Con deuda pendiente"
-        : "Al día";
+        : hayDesconocidas
+          ? "No se pudo determinar con certeza, verificá en Autogestión"
+          : "Al día";
     } catch (err) {
       logger.error(`No se pudieron obtener aranceles en Campus Autogestión: ${err}`);
       arancelesError = err;

@@ -153,11 +153,12 @@ export async function extractPdfContent(
     for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
       const page = await doc.getPage(pageNum);
       const textContent = await page.getTextContent();
-      const strings = (textContent.items as Array<{ str?: string }>)
-        .map((item) => item.str || "")
-        .filter((s) => s.trim().length > 0);
-
-      const pageText = strings.join(" ").trim();
+      const pageText = (textContent.items as Array<{ str?: string; hasEOL?: boolean }>)
+        .map((item) => (item.str || "") + (item.hasEOL ? "\n" : " "))
+        .join("")
+        .replace(/[^\S\n]+/g, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
 
       if (pageText.length > 0) {
         blocks.push({

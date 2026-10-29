@@ -1317,10 +1317,16 @@ export function createServer(services: ServerServices = {}): McpServer {
         const plan = await _getPlanEstudio(carrera);
         const materias = plan.materiasHabilitadasParaCursar || [];
         await reportProgress(100, 100, "Materias habilitadas calculadas con éxito.");
+        const avisoParcial =
+          plan.materiasSinVerificar && plan.materiasSinVerificar > 0
+            ? ` (Nota: análisis preliminar; hay ${plan.materiasSinVerificar} materias con correlativas aún en descarga en segundo plano).`
+            : "";
         const mensaje =
           materias.length > 0
-            ? `Tenés ${materias.length} materia(s) habilitada(s) para cursar en base a tu plan y correlatividades.`
-            : "No se encontraron materias pendientes habilitadas para cursar.";
+            ? `Tenés ${materias.length} materia(s) habilitada(s) para cursar en base a tu plan y correlatividades.${avisoParcial}`
+            : (plan.materiasSinVerificar && plan.materiasSinVerificar > 0
+                ? "Grafo de correlativas descargándose en segundo plano; consultá nuevamente en unos segundos."
+                : "No se encontraron materias pendientes habilitadas para cursar.");
         return {
           content: [
             {
@@ -1650,7 +1656,7 @@ export function createServer(services: ServerServices = {}): McpServer {
       }
     );
 
-    // Tool 17: guarani_inscribir_examen (Mutación atómica de examen con Canal B - registrada si no está desactivada explícitamente)
+    // Tool 17: guarani_inscribir_examen (Mutación atómica de examen con Canal B)
     if (process.env.UCA_HABILITAR_INSCRIPCION_FINAL !== "false" && process.env.UCA_HABILITAR_INSCRIPCION_FINAL !== "0") {
       server.registerTool(
         "guarani_inscribir_examen",

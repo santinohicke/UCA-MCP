@@ -146,7 +146,7 @@
     },
     {
       "name": "guarani_inscribir_examen",
-      "description": "[EXPERIMENTAL - DESACTIVADA] Inscribe formalmente a un examen final en SIU Guaraní mediante ciclo en dos fases (Canal B)."
+      "description": "Inscribe formalmente a un examen final en SIU Guaraní mediante ciclo en dos fases y confirmación física en Canal B."
     },
     {
       "name": "guarani_certificado_alumno_regular",

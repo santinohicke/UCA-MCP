@@ -10,11 +10,8 @@ import { CONFIG } from "../config.js";
 // Bloqueo combinado intra-proceso (guaraniMutex) e inter-proceso (guarani.lock)
 // Si ya estamos dentro del mutex (llamada re-entrante), se omite el file lock para evitar deadlock.
 export async function withGuaraniLock<T>(fn: () => Promise<T>): Promise<T> {
+  if (guaraniMutex.isInsideLock()) return fn();
   return guaraniMutex.runExclusive(() => {
-    if (guaraniMutex.isInsideLock()) {
-      // Ya estamos en un frame outer con el file lock adquirido; solo ejecutar sin re-adquirir.
-      return fn();
-    }
     const lockPath = path.join(CONFIG.BASE_DIR, "guarani.lock");
     return withInterProcessLock(lockPath, fn);
   });
@@ -687,9 +684,10 @@ export async function ensureCarreraActiva(
       const validas = all.filter((c) => !NON_DEGREE_PATTERN.test(c.nombre));
       disponibles = validas.length > 0 ? validas : all;
 
-      if (session) {
-        session.carrerasDisponibles = disponibles;
-        saveEncryptedSession(session);
+      const s = loadEncryptedSession();
+      if (s) {
+        s.carrerasDisponibles = disponibles;
+        saveEncryptedSession(s);
       }
     } catch (err) {
       logger.warn(`No se pudieron descubrir las carreras en Guaraní: ${err}`);
@@ -716,8 +714,8 @@ export async function ensureCarreraActiva(
     const targetId = match ? match.id : targetCarrera;
     const targetNombre = match ? match.nombre : targetCarrera;
 
-    // Si ya está activa en la sesión, saltear conmutación y verificación para ahorrar 2 requests
-    if (session?.carreraActiva === targetNombre) {
+    // Si ya está activa en la sesión, saltear conmutación y verificación para ahorrar 2 requests (salvo forceStrict)
+    if (!forceStrict && session?.carreraActiva === targetNombre) {
       carreraActivaVerificada = { nombre: targetNombre, checkedAt: Date.now() };
       return { activa: targetNombre, disponibles: disponibles.map((c) => c.nombre) };
     }
@@ -759,9 +757,10 @@ export async function ensureCarreraActiva(
       );
     }
 
-    if (session) {
-      session.carreraActiva = targetNombre;
-      saveEncryptedSession(session);
+    const s = loadEncryptedSession();
+    if (s) {
+      s.carreraActiva = targetNombre;
+      saveEncryptedSession(s);
     }
     carreraActivaVerificada = { nombre: targetNombre, checkedAt: Date.now() };
     return { activa: targetNombre, disponibles: disponibles.map((c) => c.nombre) };
@@ -770,15 +769,16 @@ export async function ensureCarreraActiva(
   // 2. Si solo hay 1 carrera de grado/posgrado disponible, conmutar automáticamente para asegurar contexto en Guaraní
   if (disponibles.length === 1) {
     const unica = disponibles[0];
-    if (session?.carreraActiva === unica.nombre) {
+    if (!forceStrict && session?.carreraActiva === unica.nombre) {
       carreraActivaVerificada = { nombre: unica.nombre, checkedAt: Date.now() };
       return { activa: unica.nombre, disponibles: [unica.nombre] };
     }
     try {
       await guaraniFetch(`/acceso/cambiar_carrera?id=${encodeURIComponent(unica.id)}&op=inicio_alumno`);
-      if (session) {
-        session.carreraActiva = unica.nombre;
-        saveEncryptedSession(session);
+      const s = loadEncryptedSession();
+      if (s) {
+        s.carreraActiva = unica.nombre;
+        saveEncryptedSession(s);
       }
     } catch (err) {
       logger.warn(`Fallo al auto-conmutar a la carrera ${unica.nombre}: ${err}`);
@@ -798,9 +798,12 @@ export async function ensureCarreraActiva(
   } catch {}
 
   const activa = realActiva || session?.carreraActiva || disponibles[0]?.nombre;
-  if (session && realActiva && session.carreraActiva !== realActiva) {
-    session.carreraActiva = realActiva;
-    saveEncryptedSession(session);
+  if (realActiva) {
+    const s = loadEncryptedSession();
+    if (s && s.carreraActiva !== realActiva) {
+      s.carreraActiva = realActiva;
+      saveEncryptedSession(s);
+    }
   }
   if (activa) {
     carreraActivaVerificada = { nombre: activa, checkedAt: Date.now() };
@@ -1073,7 +1076,7 @@ export function parsePlanEstudio(html: string): PlanEstudiosInfo {
       const rawNotaLower = rawNota.toLowerCase();
       if (rawNotaLower.includes("promocion") || (origen && origen.toLowerCase().includes("promoci"))) {
         estado = "Promocionada";
-      } else if (rawNotaLower.includes("aprobad") || rawNotaLower.includes("aprob")) {
+      } else if (!rawNotaLower.includes("desaprob") && (rawNotaLower.includes("aprobad") || rawNotaLower.includes("aprob"))) {
         estado = "Aprobada";
       } else if (rawNotaLower.includes("regular")) {
         estado = "Regularizada";
@@ -1397,13 +1400,41 @@ export async function getPlanEstudio(
   });
 
   const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
-  let graph = getGraph(cachePath);
+
+  let mat: MateriaPlan | undefined;
+  let priorityIds: string[] = [];
+  let targetAnio: number | undefined;
+
+  if (targetMateria) {
+    const normTarget = normalizeMateria(targetMateria);
+    mat =
+      planInfo.materias.find(
+        (m) => normalizeMateria(m.nombre) === normTarget || m.codigo.toLowerCase() === normTarget.toLowerCase()
+      ) ||
+      planInfo.materias.find((m) => matchMateriaFilter(m.nombre, targetMateria));
+    if (mat) {
+      priorityIds = [mat.elementoId].filter(Boolean) as string[];
+      targetAnio = mat.anio;
+    }
+  }
+
+  const job = startGraphJob(planInfo, cachePath, priorityIds, targetAnio);
+
+  // Esperar hasta 3.5s por el pool de correlativas para no bloquear la respuesta en clientes MCP
+  await Promise.race([job.promise, new Promise((resolve) => setTimeout(resolve, 3500))]);
+
+  const graph = getGraph(cachePath);
 
   // Calcular qué materias pendientes se encuentran habilitadas para cursar el próximo período
+  let materiasSinVerificar = 0;
   planInfo.materiasHabilitadasParaCursar = planInfo.materias.filter((m) => {
     if (m.estado !== "Pendiente") return false;
     const corr = m.elementoId ? graph[m.elementoId] : null;
-    if (!corr || !corr.paraCursar || corr.paraCursar.length === 0) {
+    if (!corr) {
+      materiasSinVerificar++;
+      return false;
+    }
+    if (!corr.paraCursar || corr.paraCursar.length === 0) {
       return true;
     }
     return corr.paraCursar.every((req) => {
@@ -1418,31 +1449,14 @@ export async function getPlanEstudio(
     });
   });
 
-  if (!targetMateria) {
-    // Si solo consultó el plan general, pre-calentar el grafo en segundo plano para consultas posteriores
-    startGraphJob(planInfo, cachePath);
+  if (!targetMateria || !mat) {
+    if (targetMateria && !mat) {
+      planInfo.resumenImpacto = `No se encontró la materia '${targetMateria}' en el plan de estudios de ${planInfo.propuesta || "la carrera"}.`;
+    }
+    planInfo.analisisCompleto = materiasSinVerificar === 0 && job.failed.length === 0;
+    planInfo.materiasSinVerificar = materiasSinVerificar;
     return planInfo;
   }
-
-  const normTarget = normalizeMateria(targetMateria);
-  // Priorizar coincidencia exacta (nombre normalizado o código) antes de matching parcial
-  const mat =
-    planInfo.materias.find(
-      (m) => normalizeMateria(m.nombre) === normTarget || m.codigo.toLowerCase() === normTarget.toLowerCase()
-    ) ||
-    planInfo.materias.find((m) => matchMateriaFilter(m.nombre, targetMateria));
-
-  if (!mat) {
-    return planInfo;
-  }
-
-  const priorityIds = [mat.elementoId].filter(Boolean) as string[];
-  const job = startGraphJob(planInfo, cachePath, priorityIds, mat.anio);
-
-  // Esperar hasta 3.5s por el pool de correlativas para no bloquear la respuesta en clientes MCP
-  await Promise.race([job.promise, new Promise((resolve) => setTimeout(resolve, 3500))]);
-
-  graph = getGraph(cachePath);
 
   // 1. Correlativas de la materia consultada
   if (mat.elementoId && graph[mat.elementoId]) {
@@ -1476,7 +1490,7 @@ export async function getPlanEstudio(
   // 2. Análisis de impacto a futuro: descubrir qué materias posteriores dependen de esta
   const materiasDependientes: NonNullable<MateriaPlan["materiasQueDependenDeEsta"]> = [];
   const candidatasFuturas = planInfo.materias.filter((m) => isPotentialDependent(m, mat));
-  const materiasSinVerificar = candidatasFuturas.filter((c) => !graph[c.elementoId!]).length;
+  materiasSinVerificar = candidatasFuturas.filter((c) => !graph[c.elementoId!]).length;
   const analisisCompleto = materiasSinVerificar === 0 && job.failed.length === 0;
 
   for (const fut of candidatasFuturas) {
@@ -1842,31 +1856,33 @@ export function parseHorarioSemanal(rawText: string): ClaseHorario[] {
 
 // 8. Consultar horario semanal estructurado y clases del día ("¿Qué tengo hoy?")
 export async function getHorarioSemanal(carrera?: string, diaFiltro?: string): Promise<HorarioSemanalInfo> {
-  const { activa } = await ensureCarreraActiva(carrera);
+  return withGuaraniLock(async () => {
+    const { activa } = await ensureCarreraActiva(carrera);
   const calRes = await guaraniFetch("/calendario");
   const calRaw = await readGuaraniText(calRes);
   const todasClases = parseHorarioSemanal(calRaw);
 
+  const normDia = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+
   let diaTarget: string | undefined;
   if (diaFiltro) {
-    const dfLower = diaFiltro.toLowerCase().trim();
-    if (dfLower === "hoy" || dfLower === "today") {
+    const dfNorm = normDia(diaFiltro);
+    if (dfNorm === "hoy" || dfNorm === "today") {
       const hoyStr = new Date().toLocaleDateString("es-AR", {
         weekday: "long",
         timeZone: "America/Argentina/Buenos_Aires"
       });
       diaTarget = hoyStr.charAt(0).toUpperCase() + hoyStr.slice(1).toLowerCase();
-      // Normalizar acento en Miércoles
-      if (diaTarget.toLowerCase().startsWith("miercol")) diaTarget = "Miércoles";
-      if (diaTarget.toLowerCase().startsWith("sabad")) diaTarget = "Sábado";
+      if (normDia(diaTarget).startsWith("miercol")) diaTarget = "Miércoles";
+      if (normDia(diaTarget).startsWith("sabad")) diaTarget = "Sábado";
     } else {
-      const match = Object.values(DIAS_NOMBRE_MAP).find((d) => d.toLowerCase().startsWith(dfLower.slice(0, 3)));
+      const match = Object.values(DIAS_NOMBRE_MAP).find((d) => normDia(d).startsWith(dfNorm.slice(0, 3)));
       diaTarget = match || diaFiltro;
     }
   }
 
   const clasesFiltradas = diaTarget
-    ? todasClases.filter((c) => c.dia.toLowerCase() === diaTarget!.toLowerCase())
+    ? todasClases.filter((c) => normDia(c.dia) === normDia(diaTarget!))
     : todasClases;
 
   const agendaPorDia: Record<string, ClaseHorario[]> = {};
@@ -1889,14 +1905,15 @@ export async function getHorarioSemanal(carrera?: string, diaFiltro?: string): P
       : "No se encontraron clases programadas en el calendario de cursada.";
   }
 
-  return {
-    carrera: activa,
-    totalClasesSemana: todasClases.length,
-    diaFiltrado: diaTarget,
-    clases: clasesFiltradas,
-    agendaPorDia,
-    mensaje
-  };
+    return {
+      carrera: activa,
+      totalClasesSemana: todasClases.length,
+      diaFiltrado: diaTarget,
+      clases: clasesFiltradas,
+      agendaPorDia,
+      mensaje
+    };
+  });
 }
 
 export interface MateriaRankingOptimo {
@@ -2034,14 +2051,19 @@ export async function getPlanOptimo(carrera?: string, maxMateriasSugeridas = 5):
 
   const sugeridas = ranking.slice(0, maxMateriasSugeridas).map((r) => `${r.nombre} (${r.codigo}) - Año ${r.anio}`);
 
+  const avisoParcial =
+    planInfo.materiasSinVerificar && planInfo.materiasSinVerificar > 0
+      ? `\n⚠️ Nota: Grafo de correlatividades en pre-calentamiento (${planInfo.materiasSinVerificar} materias pendientes aún sin verificar en segundo plano). Consultá nuevamente en unos segundos para la ruta definitiva.`
+      : "";
   const mensaje = ranking.length > 0
     ? `Análisis de ruta crítica para ${planInfo.propuesta || "tu carrera"}:\n` +
       `· Materias pendientes: ${pendientes.size}\n` +
       `· Cuatrimestres mínimos estimados hasta recibirse: ~${cuatrimestresEstimados} cuatrimestre(s) (según cadena crítica de correlativas).\n` +
       `· Materia más crítica para cursar primero: '${ranking[0].nombre}' (cadena de ${ranking[0].alturaCaminoCritico} materias sucesivas, desbloquea ${ranking[0].totalDesbloqueosTransitivas} a futuro).\n` +
       `· Cursada sugerida próxima (${sugeridas.length} materias):\n` +
-      sugeridas.map((s, idx) => `  ${idx + 1}. ${s}`).join("\n")
-    : `No tenés materias pendientes habilitadas para cursar en ${planInfo.propuesta || "tu carrera"}.`;
+      sugeridas.map((s, idx) => `  ${idx + 1}. ${s}`).join("\n") +
+      avisoParcial
+    : `No tenés materias pendientes habilitadas para cursar en ${planInfo.propuesta || "tu carrera"}.` + avisoParcial;
 
   return {
     carrera: planInfo.propuesta,

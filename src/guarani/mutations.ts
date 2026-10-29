@@ -430,13 +430,22 @@ export async function solicitarCertificadoAlumnoRegular(
         return m ? new Date(parseInt(m[3], 10), parseInt(m[2], 10) - 1, parseInt(m[1], 10)).getTime() : 0;
       };
 
-      // Ordenar por fecha descendente para encontrar la más nueva disponible
+      // Ordenar por fecha descendente para encontrar la más nueva disponible con destinatario compatible
+      const normPres = (s?: string) => (s || "").toLowerCase().trim();
+      const targetPres = normPres(presentarA);
+      const esDestinatarioCompatible = (sPres?: string): boolean => {
+        if (!targetPres || targetPres === "a quien corresponda") return true;
+        const sNorm = normPres(sPres);
+        return sNorm.includes(targetPres) || targetPres.includes(sNorm);
+      };
+
       const candidatos = existentes
         .filter(
           (s) =>
             Boolean(s.urlDescarga) &&
             (s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
-              (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular")))
+              (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular"))) &&
+            esDestinatarioCompatible(s.presentarA)
         )
         .sort((a, b) => parseFecha(b.fecha) - parseFecha(a.fecha));
 
@@ -608,7 +617,8 @@ export async function getHistorialConstancias(
   carrera?: string,
   descargar = false
 ): Promise<SolicitudListadoItem[]> {
-  await ensureCarreraActiva(carrera);
+  return withGuaraniLock(async () => {
+    await ensureCarreraActiva(carrera);
   const res = await guaraniFetch("/solicitudes");
   const raw = await readGuaraniText(res);
   const items: SolicitudListadoItem[] = parseSolicitudesListado(unwrapChulupiHtml(raw));
@@ -633,5 +643,6 @@ export async function getHistorialConstancias(
     }
   }
 
-  return items;
+    return items;
+  });
 }

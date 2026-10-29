@@ -107,18 +107,22 @@ let pendingCookiesToMerge: StoredCookie[] = [];
 
 // Escribe en disco cualquier actualización diferida de cookies pendiente
 export function flushPendingSessionSave(): void {
-  if (cookieSaveTimeout) {
-    clearTimeout(cookieSaveTimeout);
-    cookieSaveTimeout = null;
-  }
-  if (pendingCookiesToMerge.length > 0) {
-    const toApply = [...pendingCookiesToMerge];
-    pendingCookiesToMerge = [];
-    const session = loadEncryptedSession();
-    if (session) {
-      session.cookies = mergeCookies(session.cookies || [], toApply);
-      saveEncryptedSession(session, false);
+  try {
+    if (cookieSaveTimeout) {
+      clearTimeout(cookieSaveTimeout);
+      cookieSaveTimeout = null;
     }
+    if (pendingCookiesToMerge.length > 0) {
+      const toApply = [...pendingCookiesToMerge];
+      pendingCookiesToMerge = [];
+      const session = loadEncryptedSession();
+      if (session) {
+        session.cookies = mergeCookies(session.cookies || [], toApply);
+        saveEncryptedSession(session, false);
+      }
+    }
+  } catch (err) {
+    logger.warn(`No se pudo persistir cookies diferidas en sesión: ${err}`);
   }
 }
 

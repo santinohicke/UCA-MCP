@@ -117,8 +117,8 @@ export function extractForumReplyContext(
     discHtml.match(/data-reply-subject="([^"]+)"/i) ||
     $disc(".discussionname, h3, h2").first().text().trim();
 
-  const baseSubject =
-    typeof matchSubject === "string" ? matchSubject : matchSubject?.[1] || `Discusión ${discusionId ? `#${discusionId}` : ""}`;
+  const rawSubject = typeof matchSubject === "string" ? matchSubject.trim() : matchSubject?.[1]?.trim();
+  const baseSubject = rawSubject || `Discusión ${discusionId ? `#${discusionId}` : ""}`;
   const replySubject = baseSubject.toLowerCase().startsWith("re:") ? baseSubject : `Re: ${baseSubject}`;
 
   const nombreForo =
@@ -180,11 +180,11 @@ export async function guardarBorradorTarea(
   // Rechazar si el texto contiene caracteres invisibles o de control que el diálogo eliminaría (what-you-see ≠ what-you-send)
   let textoClean: string | undefined;
   if (textoEnLinea) {
-    const textoNormalized = textoEnLinea.replace(/\r\n|\r/g, "\n");
+    const textoNormalized = textoEnLinea.replace(/\r\n|\r/g, "\n").trim();
     textoClean = sanitizeDialogText(textoNormalized, 350, true);
     if (textoClean !== textoNormalized) {
       throw new Error(
-        "El texto en línea contiene caracteres invisibles o de control no permitidos."
+        "El texto en línea contiene formato o caracteres no permitidos (dobles espacios, tabulaciones, saltos de línea excesivos o caracteres de control)."
       );
     }
   }
@@ -521,7 +521,7 @@ export async function responderForo(
   const msgNormalized = msgTrimmed.replace(/\r\n|\r/g, "\n");
   const msgClean = sanitizeDialogText(msgNormalized, 350, true);
   if (msgClean !== msgNormalized) {
-    throw new Error("El mensaje contiene caracteres invisibles o de control no permitidos.");
+    throw new Error("El mensaje contiene formato o caracteres no permitidos (dobles espacios, tabulaciones, saltos de línea excesivos o caracteres de control).");
   }
 
   await onProgress?.("Identificando hilo de discusión en EVA Moodle...");

@@ -57,16 +57,17 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
   // Detección de novedades comparando con snapshot anterior
   let novedades: ResumenNovedades | undefined;
   const snapshotPath = path.join(CONFIG.CACHE_DIR, "resumen_snapshot.json");
+  let prevSnapshot: ResumenSnapshotData | undefined;
   try {
     if (fs.existsSync(snapshotPath)) {
-      const prev: ResumenSnapshotData = JSON.parse(fs.readFileSync(snapshotPath, "utf-8"));
-      const prevTasks = new Set(prev.knownTaskIds || []);
-      const prevForums = new Set(prev.knownForumPostIds || []);
+      prevSnapshot = JSON.parse(fs.readFileSync(snapshotPath, "utf-8"));
+      const prevTasks = new Set(prevSnapshot?.knownTaskIds || []);
+      const prevForums = new Set(prevSnapshot?.knownForumPostIds || []);
 
-      const nuevasTareas = tareasProximas
+      const nuevasTareas = (tareasRes.status === "fulfilled" ? tareasProximas : [])
         .filter((t) => !prevTasks.has(t.id))
         .map((t) => ({ id: t.id, nombre: t.nombre, materia: t.materiaNombre }));
-      const nuevosAvisos = avisosRecientes
+      const nuevosAvisos = (forosRes.status === "fulfilled" ? avisosRecientes : [])
         .filter((a) => !prevForums.has(a.id))
         .map((a) => ({ id: a.id, asunto: a.asunto, autor: a.autor }));
 
@@ -82,12 +83,18 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
     }
   } catch {}
 
-  // Guardar snapshot actualizado
+  // Guardar snapshot actualizado (preservando IDs de fuentes que hayan fallado)
   try {
     const currentSnapshot: ResumenSnapshotData = {
       timestamp: Math.floor(Date.now() / 1000),
-      knownTaskIds: tareasProximas.map((t) => t.id),
-      knownForumPostIds: avisosRecientes.map((a) => a.id)
+      knownTaskIds:
+        tareasRes.status === "fulfilled"
+          ? tareasProximas.map((t) => t.id)
+          : prevSnapshot?.knownTaskIds || [],
+      knownForumPostIds:
+        forosRes.status === "fulfilled"
+          ? avisosRecientes.map((a) => a.id)
+          : prevSnapshot?.knownForumPostIds || []
     };
     fs.writeFileSync(snapshotPath, JSON.stringify(currentSnapshot, null, 2), "utf-8");
   } catch {}

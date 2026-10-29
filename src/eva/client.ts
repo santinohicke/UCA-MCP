@@ -531,6 +531,12 @@ export async function getTareasYNotas(
   const MAX_TASKS_TO_QUERY = 40;
   const BATCH_SIZE = 10;
   const statusResults = new Map<number, { estadoEntrega: string; submissionGrade?: string }>();
+  // Priorizar tareas con vencimiento próximo antes de cortar el lote a consultar
+  itemsToProcess.sort((a, b) => {
+    const aDue = a.duedate > 0 ? a.duedate : Infinity;
+    const bDue = b.duedate > 0 ? b.duedate : Infinity;
+    return aDue - bDue;
+  });
   const tasksToQuery = itemsToProcess.filter((item) => item.assignId).slice(0, MAX_TASKS_TO_QUERY);
   const chunks: Array<typeof tasksToQuery> = [];
   for (let i = 0; i < tasksToQuery.length; i += BATCH_SIZE) {
@@ -1202,20 +1208,26 @@ export interface CronogramaMateriaResult {
 
 // 7. Buscar cronograma o programa de una materia y extraer fechas de parciales y recuperatorios
 export async function getCronogramaMateria(materia: string): Promise<CronogramaMateriaResult> {
-  const courses = await getMaterias(true);
+  // Priorizar cursos activos (inprogress/future) antes de buscar en materias históricas/archivadas
+  const activeCourses = await getMaterias(false);
   const targetLower = materia.toLowerCase().trim();
-  // Priorizar coincidencia exacta antes de matching parcial
-  const course =
-    courses.find((c) => {
+  const searchIn = (pool: MateriaInfo[]) =>
+    pool.find((c) => {
       const cNorm = c.nombre.toLowerCase().trim();
       return cNorm === targetLower || (c.codigo && c.codigo.toLowerCase().trim() === targetLower);
     }) ||
-    courses.find(
+    pool.find(
       (c) =>
         matchMateriaFilter(c.nombre, materia) ||
         (c.codigo && c.codigo.toLowerCase().includes(targetLower)) ||
         c.nombre.toLowerCase().includes(targetLower)
     );
+
+  let course = searchIn(activeCourses);
+  if (!course) {
+    const allCourses = await getMaterias(true);
+    course = searchIn(allCourses);
+  }
 
   if (!course) {
     return {
@@ -1233,7 +1245,7 @@ export async function getCronogramaMateria(materia: string): Promise<CronogramaM
       const nom = mod.nombre.toLowerCase();
       if (!cronogramaMod && /cronograma|calendario|fechas\s+de\s+(?:parcial|examen|cursada)/i.test(nom)) {
         cronogramaMod = mod;
-      } else if (!programaMod && /programa|planificaci[oó]n/i.test(nom)) {
+      } else if (!programaMod && /\bprograma\b|planificaci[oó]n/i.test(nom)) {
         programaMod = mod;
       }
     }
@@ -1347,10 +1359,12 @@ export async function getEntregasProximas(
   dias = 7,
   cursoId?: number
 ): Promise<EntregasProximasResult> {
-  const [tareas, foros] = await Promise.all([
+  const [tareasRes, forosRes] = await Promise.allSettled([
     getTareasYNotas(cursoId, false),
     getForos(cursoId, 5)
   ]);
+  const tareas = tareasRes.status === "fulfilled" ? tareasRes.value : [];
+  const foros = forosRes.status === "fulfilled" ? forosRes.value : [];
 
   const nowUnix = Math.floor(Date.now() / 1000);
   const limiteUnix = nowUnix + dias * 86400;
