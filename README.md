@@ -23,7 +23,7 @@ Servidor **Model Context Protocol (MCP)** open source para conectar a tus asiste
 
 ### Opción 1: Instalación Sin Terminal con `.mcpb` (Recomendada para Claude Desktop)
 
-1. Descargá el paquete preempaquetado [`uca-mcp-1.0.5.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde los Releases.
+1. Descargá el paquete preempaquetado [`uca-mcp-1.0.6.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde los Releases.
 2. Entra a **Configuración -> Extensiones** y arrastrá el archivo `.mcpb`. Claude Desktop te dejará instalarlo sin requerir consola ni comandos.
 3. Abrí un nuevo chat en Claude y escribí:  
    > *"Iniciá sesión en UCA"*
