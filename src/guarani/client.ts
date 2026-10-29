@@ -47,6 +47,7 @@ export interface CursadaInfo {
   detalleInasistencias?: InasistenciaDetalle[];
   horario?: string;
   docentes?: string;
+  advertencia?: string;
 }
 
 export function calcularFaltas(porcentajeAsistencia: number, inasistencias: number): CalculoFaltas {
@@ -182,21 +183,27 @@ export function unwrapChulupiHtml(rawText: string): string {
     if (j && typeof j.cont === "string") text = j.cont;
   } catch {}
 
-  const match = text.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/);
-  if (match) {
-    try {
-      const raw = match[1];
-      const parsed = JSON.parse(raw);
-      if (parsed?.content) return parsed.content;
-    } catch {
+  const matches = [...text.matchAll(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/g)];
+  if (matches.length > 0) {
+    const contents: string[] = [];
+    for (const match of matches) {
       try {
-        const unescaped = match[1]
-          .replace(/\\"/g, '"')
-          .replace(/\\'/g, "'")
-          .replace(/\\\\/g, "\\");
-        const parsed = JSON.parse(unescaped);
-        if (parsed?.content) return parsed.content;
-      } catch {}
+        const raw = match[1];
+        const parsed = JSON.parse(raw);
+        if (parsed?.content) contents.push(parsed.content);
+      } catch {
+        try {
+          const unescaped = match[1]
+            .replace(/\\"/g, '"')
+            .replace(/\\'/g, "'")
+            .replace(/\\\\/g, "\\");
+          const parsed = JSON.parse(unescaped);
+          if (parsed?.content) contents.push(parsed.content);
+        } catch {}
+      }
+    }
+    if (contents.length > 0) {
+      return contents.join("\n");
     }
   }
 
@@ -290,7 +297,7 @@ export function parseReporteInasistencias(html: string): InasistenciasMateriaPar
     const leftText = $(el).find(".titulo-corte .pull-left").text().replace(/\s+/g, " ").trim();
     const rightText = $(el).find(".titulo-corte .pull-right").text().replace(/\s+/g, " ").trim();
 
-    const codMatch = /\(([A-Z0-9]+)\)\s*([^-]+)(?:-\s*Comisi[oó]n:\s*(.*))?/i.exec(leftText);
+    const codMatch = /\(([A-Z0-9]+)\)\s*(.+?)(?:\s*-\s*Comisi[oó]n:\s*(.*))?$/i.exec(leftText);
     const codigo = codMatch ? codMatch[1].trim() : undefined;
     const materia = codMatch ? codMatch[2].trim() : leftText;
     const comision = codMatch && codMatch[3] ? codMatch[3].trim() : undefined;
@@ -460,6 +467,52 @@ export function parseHistoriaAcademica(
           folio: tds[5] || undefined
         });
       }
+    }
+  });
+
+  // Soporte para estructura moderna de Chulupi en SIU Guaraní (.catedras / .catedra)
+  $(".catedra").each((_, el) => {
+    const rawTitulo = $(el).find("h4").first().text().replace(/\s+/g, " ").trim();
+    if (!rawTitulo) return;
+
+    const codMatch = /\(([A-Z0-9]+)\)/i.exec(rawTitulo);
+    const codigo = codMatch ? codMatch[1] : undefined;
+    const materia = rawTitulo.replace(/\([A-Z0-9]+\)/i, "").trim();
+
+    const spanText = $(el).find(".catedra_nombre span").first().text().replace(/\s+/g, " ").trim();
+    const strongType = $(el).find(".catedra_nombre strong").first().text().trim().toLowerCase();
+    const origen = ($(el).find("a[data-origen]").attr("data-origen") || strongType).toLowerCase();
+
+    let tipo: MateriaAprobada["tipo"] = "Otro";
+    if (origen.includes("prom")) tipo = "Promoción";
+    else if (origen.includes("exam")) tipo = "Examen";
+    else if (origen.includes("equiv")) tipo = "Equivalencia";
+
+    // Extraer fecha (dd/mm/aaaa)
+    const fechaMatch = /(\d{2}\/\d{2}\/\d{4})/.exec(spanText);
+    const fecha = fechaMatch ? fechaMatch[1] : "";
+
+    // Extraer nota numérica o concepto (ej. "6 (Bueno)", "S (Suficiente)")
+    const notaMatch = /-\s*([A-Za-z0-9]+(?:\s*\([^)]+\))?)\s*(?:Aprobado|Promocionado)/i.exec(spanText);
+    const notaRaw = notaMatch ? notaMatch[1].trim() : "";
+    const notaNumMatch = /^(\d+)/.exec(notaRaw);
+    const nota = notaNumMatch ? parseInt(notaNumMatch[1], 10) : notaRaw;
+
+    if (origen.includes("reg") || strongType.includes("reg")) {
+      const vencMatch = /vencimiento[:\s]+(\d{2}\/\d{2}\/\d{4})/i.exec(spanText);
+      materiasRegulares.push({
+        materia,
+        fecha,
+        vencimiento: vencMatch ? vencMatch[1] : undefined
+      });
+    } else {
+      materiasAprobadas.push({
+        materia,
+        codigo,
+        fecha,
+        nota,
+        tipo
+      });
     }
   });
 
@@ -725,33 +778,43 @@ export async function ensureCarreraActiva(
       throw new Error(`Error al conmutar a la carrera '${targetNombre}' en Guaraní (HTTP ${changeRes.status}).`);
     }
 
-    // Verificación estricta del estado activo en el servidor para evitar inscribir en carrera equivocada
-    const verifyRes = await guaraniFetch("/", {
-      headers: { "X-Requested-With": "", "Accept": "text/html" }
-    });
-    const verifyHtml = await readGuaraniText(verifyRes);
-    const activeFromHtml = extractActiveCareerFromHtml(verifyHtml);
-    const $verify = cheerio.load(verifyHtml);
-    const activeIdMatch =
-      $verify(
-        `a.js-select-carreras[data-carrera-id="${targetId}"].active, ` +
-        `a.js-select-carreras[data-carrera-id="${targetId}"].selected, ` +
-        `a.js-select-carreras[data-carrera-id="${targetId}"][data-carrera-selected="1"], ` +
-        `li.active a.js-select-carreras[data-carrera-id="${targetId}"]`
-      ).length > 0;
+    const changeText = await readGuaraniText(changeRes);
+    let switchedOk = false;
+    try {
+      const parsedChange = JSON.parse(changeText);
+      if (parsedChange?.cod === "-2" && typeof parsedChange?.cont?.url === "string") {
+        switchedOk = true;
+      }
+    } catch {}
 
-    let matchesActive = false;
-    if (activeIdMatch) {
-      matchesActive = true;
-    } else if (activeFromHtml) {
-      const normActive = normalizeCareer(activeFromHtml);
-      const normTargetName = normalizeCareer(targetNombre);
-      const targetKeywords = normTargetName.split(" ").filter((w) => w.length > 2);
-      matchesActive =
-        normActive.includes(normTargetName) ||
-        (targetKeywords.length > 0 && targetKeywords.every((kw) => normActive.includes(kw)));
+    if (!switchedOk) {
+      const verifyRes = await guaraniFetch("/", {
+        headers: { "X-Requested-With": "", "Accept": "text/html" }
+      });
+      const verifyHtml = await readGuaraniText(verifyRes);
+      const activeFromHtml = extractActiveCareerFromHtml(verifyHtml);
+      const $verify = cheerio.load(verifyHtml);
+      const activeIdMatch =
+        $verify(
+          `a.js-select-carreras[data-carrera-id="${targetId}"].active, ` +
+          `a.js-select-carreras[data-carrera-id="${targetId}"].selected, ` +
+          `a.js-select-carreras[data-carrera-id="${targetId}"][data-carrera-selected="1"], ` +
+          `li.active a.js-select-carreras[data-carrera-id="${targetId}"]`
+        ).length > 0;
+
+      if (activeIdMatch) {
+        switchedOk = true;
+      } else if (activeFromHtml) {
+        const normActive = normalizeCareer(activeFromHtml);
+        const normTargetName = normalizeCareer(targetNombre);
+        const targetKeywords = normTargetName.split(" ").filter((w) => w.length > 2);
+        switchedOk =
+          normActive.includes(normTargetName) ||
+          (targetKeywords.length > 0 && targetKeywords.every((kw) => normActive.includes(kw)));
+      }
     }
-    if (!matchesActive) {
+
+    if (!switchedOk) {
       throw new Error(
         `Fallo al activar la carrera '${targetNombre}' en SIU Guaraní (el servidor no confirmó el cambio de carrera).`
       );
@@ -842,10 +905,12 @@ export async function getEstadoCursada(carrera?: string, forzarRefresco = false)
       ]);
 
       let inasistenciasList: InasistenciasMateriaParsed[] = [];
+      let inasistenciasDisponibles = false;
       if (inasResResult.status === "fulfilled") {
         try {
           const inasRaw = await readGuaraniText(inasResResult.value);
           inasistenciasList = parseReporteInasistencias(unwrapChulupiHtml(inasRaw));
+          inasistenciasDisponibles = true;
         } catch (err) {
           logger.warn(`No se pudo parsear /reporte_inasistencias: ${err}`);
         }
@@ -897,12 +962,14 @@ export async function getEstadoCursada(carrera?: string, forzarRefresco = false)
           cur.inasistencias = match.inasistenciasTotales;
           cur.detalleInasistencias = match.detalles;
           cur.calculoFaltas = calcularFaltas(match.porcentajeAsistencia, match.inasistenciasTotales);
-        } else {
+        } else if (inasistenciasDisponibles) {
           // Si no figura en el reporte de inasistencias, tiene 0 faltas (100% de asistencia)
           cur.asistencia = "100%";
           cur.inasistencias = 0;
           cur.detalleInasistencias = [];
           cur.calculoFaltas = calcularFaltas(100, 0);
+        } else {
+          cur.advertencia = "Reporte de inasistencias no disponible momentáneamente en Guaraní.";
         }
       }
 
@@ -925,7 +992,9 @@ export async function getEstadoCursada(carrera?: string, forzarRefresco = false)
         }
       }
 
-      cursadaCache.set(cacheKey, { data: cursadas, expires: Date.now() + GUARANI_CACHE_TTL_MS });
+      if (inasistenciasDisponibles) {
+        cursadaCache.set(cacheKey, { data: cursadas, expires: Date.now() + GUARANI_CACHE_TTL_MS });
+      }
       return cursadas;
     } catch (err) {
       logger.error("Error al obtener estado de cursada en Guaraní", err);
@@ -948,9 +1017,9 @@ export async function getHistoriaAcademica(carrera?: string, forzarRefresco = fa
     try {
       const { activa, disponibles } = await ensureCarreraActiva(carrera);
 
-      // Lanzar historia académica y porcentaje de avance en paralelo
+      // Lanzar historia académica con filtros de materias aprobadas y porcentaje de avance en paralelo
       const [histResResult, avanceResResult] = await Promise.allSettled([
-        guaraniFetch("/historia_academica"),
+        guaraniFetch("/historia_academica/?checks=PromocionA,RegularidadA,ExamenA,EquivalenciaA,AprobResA,CreditosA&modo=anio"),
         guaraniFetch("/porcentaje_avance_carrera")
       ]);
 
@@ -1959,8 +2028,8 @@ export async function getPlanOptimo(carrera?: string, maxMateriasSugeridas = 5):
     if (m.elementoId && graph[m.elementoId]) {
       const reqs = [...(graph[m.elementoId].paraCursar || []), ...(graph[m.elementoId].paraAprobar || [])];
       for (const req of reqs) {
-        const matReq = planInfo.materias.find(
-          (mat) => (req.codigo && mat.codigo === req.codigo) || matchMateriaFilter(mat.nombre, req.materia)
+        const matReq = planInfo.materias.find((mat) =>
+          matchMateria(mat.codigo, mat.nombre, req.codigo, req.materia)
         );
         if (matReq) {
           const keyReq = matReq.codigo || matReq.nombre;

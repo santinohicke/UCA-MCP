@@ -33,11 +33,17 @@ export function parseEstadoCuota(raw: string): CuotaInfo["estado"] {
   const s = raw.toLowerCase().trim();
   if (!s) return "Desconocido";
   // Exclusiones explícitas de "sin deuda" antes de chequear la palabra "deuda"
-  if (s.includes("sin deuda") || s.includes("no adeuda") || s.includes("libre de deuda") || s.includes("al dia") || s.includes("al día")) {
+  if (s.includes("sin deuda") || s.includes("no adeuda") || s.includes("libre de deuda")) {
     return "Pagado";
+  }
+  if (s.includes("al dia") || s.includes("al día")) {
+    return "Al día";
   }
   // Casos negativos o de deuda impaga primero para evitar que 'impago' o 'no pagado' coincidan con 'pag'
   if (s.includes("no pag") || s.includes("impag") || s.includes("deuda") || s.includes("a pagar")) {
+    return "Pendiente";
+  }
+  if (s.includes("a vencer") || s.includes("no venc") || s.includes("sin vencer")) {
     return "Pendiente";
   }
   if (s.includes("venc")) {
@@ -48,9 +54,6 @@ export function parseEstadoCuota(raw: string): CuotaInfo["estado"] {
   }
   if (s.includes("pagad") || s.includes("abonad") || s.includes("cobrad") || s === "pagado" || s === "pago") {
     return "Pagado";
-  }
-  if (/\bal d[ií]a\b/i.test(s)) {
-    return "Al día";
   }
   return "Desconocido";
 }

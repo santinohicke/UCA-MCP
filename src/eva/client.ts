@@ -779,7 +779,7 @@ export async function getForos(cursoId?: number, limit = 10): Promise<ForoItem[]
         return r.data.discussions.map((d) => {
           const modTimestamp = d.modified || d.timemodified || 0;
           return {
-            id: d.id,
+            id: (d as any).discussion ?? d.id,
             modified: modTimestamp,
             asunto: (d.name || d.subject || "Aviso").replace(/[\r\n<>]/g, " ").trim(),
             autor: (d.userfullname || "Cátedra").replace(/[\r\n<>]/g, " ").trim(),
@@ -1363,7 +1363,8 @@ export async function getEntregasProximas(
     getTareasYNotas(cursoId, false),
     getForos(cursoId, 5)
   ]);
-  const tareas = tareasRes.status === "fulfilled" ? tareasRes.value : [];
+  if (tareasRes.status === "rejected") throw tareasRes.reason;
+  const tareas = tareasRes.value;
   const foros = forosRes.status === "fulfilled" ? forosRes.value : [];
 
   const nowUnix = Math.floor(Date.now() / 1000);
