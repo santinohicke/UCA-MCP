@@ -115,7 +115,7 @@ export async function inscribirExamen(
   return withGuaraniLock(async () => {
     try {
       // 0. Re-conmutar y verificar la carrera activa dentro del bloqueo para prevenir TOCTOU
-      await ensureCarreraActiva(carrera);
+      await ensureCarreraActiva(carrera, true);
 
       // 1. Obtener catálogo y token anti-CSRF fresco
       const pageRes = await guaraniFetch("/inscripcion_examen");
@@ -304,24 +304,20 @@ export function parseOpcionesConstancia(html: string): OpcionConstancia[] {
   return opciones;
 }
 
-// Parser puro para listado de solicitudes en SIU Guaraní
-export function parseSolicitudesListado(html: string): Array<{
+export interface SolicitudListadoItem {
   id?: string;
   tipo: string;
   fecha?: string;
   presentarA?: string;
   estado?: string;
   urlDescarga?: string;
-}> {
+  rutaLocal?: string;
+}
+
+// Parser puro para listado de solicitudes en SIU Guaraní
+export function parseSolicitudesListado(html: string): SolicitudListadoItem[] {
   const $ = cheerio.load(unwrapChulupiHtml(html));
-  const items: Array<{
-    id?: string;
-    tipo: string;
-    fecha?: string;
-    presentarA?: string;
-    estado?: string;
-    urlDescarga?: string;
-  }> = [];
+  const items: SolicitudListadoItem[] = [];
 
   $("table tbody tr, tr.solicitud, .solicitud-item").each((_, tr) => {
     const text = $(tr).text().replace(/\s+/g, " ").trim();
@@ -329,6 +325,8 @@ export function parseSolicitudesListado(html: string): Array<{
 
     const downloadLink = $(tr).find("a[href*='descargar'], a[href*='pdf'], a.btn-descargar, a[title*='escargar']").first();
     const urlDescarga = downloadLink.attr("href") || undefined;
+    const idMatch = urlDescarga?.match(/(?:id|solicitud|archivo)[=\/](\d+)/i) || $(tr).attr("data-id") || $(tr).attr("id");
+    const id = typeof idMatch === "string" ? idMatch : idMatch ? idMatch[1] : undefined;
     const cells = $(tr).find("td").map((__, td) => $(td).text().replace(/\s+/g, " ").trim()).get();
 
     const tipo = cells[1] || cells[0] || text;
@@ -337,6 +335,7 @@ export function parseSolicitudesListado(html: string): Array<{
     const fecha = cells[4] || undefined;
 
     items.push({
+      id,
       tipo,
       fecha,
       presentarA,
@@ -366,10 +365,10 @@ export async function solicitarCertificadoAlumnoRegular(
   const safeCopias = Math.max(1, Math.min(5, copias));
 
   // 1. Asegurar carrera activa y descubrir dinámicamente las constancias disponibles para la facultad del alumno
-  let activeCareer = carrera;
+  const actRes = await ensureCarreraActiva(carrera, true);
+  const activeCareer = actRes.activa || carrera;
+
   try {
-    const actRes = await ensureCarreraActiva(carrera);
-    activeCareer = actRes.activa || carrera;
     const formRes = await guaraniFetch("/solicitudes/nueva_solicitud");
     const formHtml = await readGuaraniText(formRes);
     const opciones = parseOpcionesConstancia(formHtml);
@@ -392,7 +391,7 @@ export async function solicitarCertificadoAlumnoRegular(
       }
     }
   } catch (err) {
-    if (err instanceof Error && err.message.includes("SIU Guaraní")) throw err;
+    if (err instanceof Error && err.message.startsWith("SIU Guaraní no ofrece")) throw err;
     logger.warn(`No se pudieron descubrir opciones dinámicas de constancia: ${err}`);
   }
 
@@ -414,11 +413,6 @@ export async function solicitarCertificadoAlumnoRegular(
       const listRes = await guaraniFetch("/solicitudes");
       const listHtml = unwrapChulupiHtml(await readGuaraniText(listRes));
       const existentes = parseSolicitudesListado(listHtml);
-      const existente = existentes.find(
-        (s) =>
-          s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
-          (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular"))
-      );
 
       // Solo reutilizar si fue emitida recientemente (últimos 30 días)
       const esReciente = (fechaStr?: string): boolean => {
@@ -430,7 +424,25 @@ export async function solicitarCertificadoAlumnoRegular(
         return diffDias >= 0 && diffDias <= 30;
       };
 
-      if (existente?.urlDescarga && esReciente(existente.fecha)) {
+      const parseFecha = (fechaStr?: string): number => {
+        if (!fechaStr) return 0;
+        const m = fechaStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+        return m ? new Date(parseInt(m[3], 10), parseInt(m[2], 10) - 1, parseInt(m[1], 10)).getTime() : 0;
+      };
+
+      // Ordenar por fecha descendente para encontrar la más nueva disponible
+      const candidatos = existentes
+        .filter(
+          (s) =>
+            Boolean(s.urlDescarga) &&
+            (s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
+              (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular")))
+        )
+        .sort((a, b) => parseFecha(b.fecha) - parseFecha(a.fecha));
+
+      const existente = candidatos.find((s) => esReciente(s.fecha));
+
+      if (existente?.urlDescarga) {
         await onProgress?.("Descargando PDF de constancia vigente...");
         const u = new URL(existente.urlDescarga, CONFIG.GUARANI_BASE_URL);
         const pdfRes = await guaraniFetch(u.pathname + u.search);
@@ -439,6 +451,7 @@ export async function solicitarCertificadoAlumnoRegular(
         if (pdfBuf.length > 50 && pdfBuf[0] === 0x25 && pdfBuf[1] === 0x50 && pdfBuf[2] === 0x44 && pdfBuf[3] === 0x46) {
           const safeName = `constancia_${tipoConstancia}_${Date.now()}.pdf`;
           const destPath = path.join(CONFIG.CERTIFICADOS_DIR, safeName);
+          fs.mkdirSync(CONFIG.CERTIFICADOS_DIR, { recursive: true, mode: 0o700 });
           fs.writeFileSync(destPath, pdfBuf);
           return {
             exito: true,
@@ -490,6 +503,19 @@ export async function solicitarCertificadoAlumnoRegular(
   return withGuaraniLock(async () => {
     await onProgress?.("Enviando solicitud formal a SIU Guaraní...", 75);
     try {
+      // 0. Re-asegurar carrera activa bajo el cerrojo para prevenir TOCTOU
+      await ensureCarreraActiva(carrera, true);
+
+      // Snapshot de URLs de solicitudes existentes para detectar con precisión el nuevo registro
+      const previousUrls = new Set<string>();
+      try {
+        const prevListRes = await guaraniFetch("/solicitudes");
+        const prevListHtml = unwrapChulupiHtml(await readGuaraniText(prevListRes));
+        for (const s of parseSolicitudesListado(prevListHtml)) {
+          if (s.urlDescarga) previousUrls.add(s.urlDescarga);
+        }
+      } catch {}
+
       const body = new URLSearchParams({
         constancia: constanciaInfo.id,
         copias: String(safeCopias),
@@ -518,11 +544,20 @@ export async function solicitarCertificadoAlumnoRegular(
       const listRes = await guaraniFetch("/solicitudes");
       const listHtml = unwrapChulupiHtml(await readGuaraniText(listRes));
       const solicitudes = parseSolicitudesListado(listHtml);
-      const nueva = solicitudes.find(
-        (s) =>
-          s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
-          (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular"))
-      );
+      // Priorizar solicitud nueva no presente en el snapshot previo
+      const nueva =
+        solicitudes.find(
+          (s) =>
+            s.urlDescarga &&
+            !previousUrls.has(s.urlDescarga) &&
+            (s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
+              (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular")))
+        ) ||
+        solicitudes.find(
+          (s) =>
+            s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
+            (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular"))
+        );
 
       let destPath: string | undefined;
       if (nueva?.urlDescarga) {
@@ -533,6 +568,7 @@ export async function solicitarCertificadoAlumnoRegular(
         if (pdfBuf.length > 50 && pdfBuf[0] === 0x25 && pdfBuf[1] === 0x50 && pdfBuf[2] === 0x44 && pdfBuf[3] === 0x46) {
           const safeName = `constancia_${tipoConstancia}_${Date.now()}.pdf`;
           destPath = path.join(CONFIG.CERTIFICADOS_DIR, safeName);
+          fs.mkdirSync(CONFIG.CERTIFICADOS_DIR, { recursive: true, mode: 0o700 });
           fs.writeFileSync(destPath, pdfBuf);
         }
       }
@@ -565,4 +601,37 @@ export async function solicitarCertificadoAlumnoRegular(
       throw err;
     }
   });
+}
+
+// Consulta el listado histórico de solicitudes de constancias sin emitir nuevas solicitudes
+export async function getHistorialConstancias(
+  carrera?: string,
+  descargar = false
+): Promise<SolicitudListadoItem[]> {
+  await ensureCarreraActiva(carrera);
+  const res = await guaraniFetch("/solicitudes");
+  const raw = await readGuaraniText(res);
+  const items: SolicitudListadoItem[] = parseSolicitudesListado(unwrapChulupiHtml(raw));
+
+  if (descargar) {
+    for (const it of items) {
+      if (it.urlDescarga) {
+        try {
+          const downloadUrl = new URL(it.urlDescarga, CONFIG.GUARANI_BASE_URL).href;
+          const u = new URL(downloadUrl);
+          const pdfRes = await guaraniFetch(u.pathname + u.search);
+          const pdfBuf = new Uint8Array(await pdfRes.arrayBuffer());
+          if (pdfBuf.length > 50 && pdfBuf[0] === 0x25 && pdfBuf[1] === 0x50 && pdfBuf[2] === 0x44 && pdfBuf[3] === 0x46) {
+            const safeName = `constancia_${(it.tipo || "solicitud").toLowerCase().replace(/[^a-z0-9]/g, "_")}_${it.id || Date.now()}.pdf`;
+            const destPath = path.join(CONFIG.CERTIFICADOS_DIR, safeName);
+            fs.mkdirSync(CONFIG.CERTIFICADOS_DIR, { recursive: true, mode: 0o700 });
+            fs.writeFileSync(destPath, pdfBuf);
+            it.rutaLocal = destPath;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return items;
 }

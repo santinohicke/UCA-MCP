@@ -5,10 +5,16 @@ import * as cheerio from "cheerio";
 import { CONFIG } from "../../config.js";
 import { evaFetch } from "../http.js";
 import { getOrCreateMasterKey } from "../../auth/keychain.js";
+import { registerSessionPurgeHook } from "../../auth/session.js";
 
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024; // 25 MB límite de seguridad
 
 const fileCache = new Map<string, { result: DownloadResult; expires: number }>();
+
+export function clearDownloaderCache(): void {
+  fileCache.clear();
+}
+registerSessionPurgeHook(clearDownloaderCache);
 
 export interface DownloadResult {
   buffer: Uint8Array;
@@ -66,55 +72,54 @@ export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefre
     }
   }
 
-  let currentUrl = fileUrl;
-  let response: Response | null = null;
-  const maxRedirects = 3;
+  const parsed = new URL(fileUrl, CONFIG.EVA_BASE_URL);
 
-  for (let hop = 0; hop <= maxRedirects; hop++) {
-    const parsed = new URL(currentUrl, CONFIG.EVA_BASE_URL);
-
-    // Si es un recurso Moodle, solicitar redirección directa al archivo
-    if (parsed.pathname === "/mod/resource/view.php" && !parsed.searchParams.has("redirect")) {
-      parsed.searchParams.set("redirect", "1");
-    }
-
-    // 1. Host y protocolo estrictos: solo https://eva.uca.edu.ar
-    if (parsed.protocol !== "https:" || parsed.origin !== new URL(CONFIG.EVA_BASE_URL).origin) {
-      throw new Error(
-        `Acceso denegado: solo se permiten descargas HTTPS desde ${CONFIG.EVA_BASE_URL}. Destino no permitido: '${parsed.origin}'`
-      );
-    }
-
-    // 2. Ruta permitida (restringida a pluginfile.php y vistas de recursos/carpetas)
-    const isAllowedPath =
-      parsed.pathname.startsWith("/pluginfile.php") ||
-      parsed.pathname === "/mod/resource/view.php" ||
-      parsed.pathname === "/mod/folder/view.php";
-
-    if (!isAllowedPath) {
-      throw new Error(
-        `Ruta no autorizada para descarga: '${parsed.pathname}'. Solo se permiten '/pluginfile.php', '/mod/resource/view.php' y '/mod/folder/view.php'.`
-      );
-    }
-
-    // Timeout extendido de 120s para la conexión y streaming del cuerpo completo
-    response = await evaFetch(parsed.href, {
-      redirect: "manual",
-      signal: AbortSignal.timeout(120000)
-    });
-
-    // Manejo de redirecciones internas verificando cada salto contra la allowlist
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const location = response.headers.get("location");
-      if (!location) {
-        throw new Error(`Redirección sin cabecera 'Location' en ${currentUrl}`);
-      }
-      currentUrl = new URL(location, currentUrl).href;
-      continue;
-    }
-
-    break;
+  // Si es un recurso Moodle, solicitar redirección directa al archivo
+  if (parsed.pathname === "/mod/resource/view.php" && !parsed.searchParams.has("redirect")) {
+    parsed.searchParams.set("redirect", "1");
   }
+
+  // 1. Host y protocolo estrictos: solo https://eva.uca.edu.ar
+  const allowedOrigin = new URL(CONFIG.EVA_BASE_URL).origin;
+  if (parsed.protocol !== "https:" || parsed.origin !== allowedOrigin) {
+    throw new Error(
+      `Acceso denegado: solo se permiten descargas HTTPS desde ${CONFIG.EVA_BASE_URL}. Destino no permitido: '${parsed.origin}'`
+    );
+  }
+
+  // 2. Ruta permitida (restringida a pluginfile.php y vistas de recursos/carpetas)
+  const isAllowedPath = (pathname: string) =>
+    pathname.startsWith("/pluginfile.php") ||
+    pathname === "/mod/resource/view.php" ||
+    pathname === "/mod/folder/view.php";
+
+  if (!isAllowedPath(parsed.pathname)) {
+    throw new Error(
+      `Ruta no autorizada para descarga: '${parsed.pathname}'. Solo se permiten '/pluginfile.php', '/mod/resource/view.php' y '/mod/folder/view.php'.`
+    );
+  }
+
+  // Timeout extendido de 120s para la conexión y streaming del cuerpo completo
+  const response = await evaFetch(parsed.href, {
+    signal: AbortSignal.timeout(120000)
+  });
+
+  const finalUrl = response.url || parsed.href;
+  const finalParsed = new URL(finalUrl, CONFIG.EVA_BASE_URL);
+
+  if (finalParsed.protocol !== "https:" || finalParsed.origin !== allowedOrigin) {
+    throw new Error(
+      `Acceso denegado: redirección hacia origen no permitido: '${finalParsed.origin}'`
+    );
+  }
+
+  if (!isAllowedPath(finalParsed.pathname)) {
+    throw new Error(
+      `Ruta final no autorizada para descarga: '${finalParsed.pathname}'.`
+    );
+  }
+
+  let currentUrl = finalUrl;
 
   if (!response || !response.ok) {
     throw new Error(`Error al descargar archivo: HTTP ${response?.status || "sin respuesta"}`);
@@ -209,6 +214,9 @@ export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefre
     }
   } else {
     filename = new URL(currentUrl).pathname.split("/").pop() || "archivo";
+    try {
+      filename = decodeURIComponent(filename);
+    } catch {}
   }
 
   const result: DownloadResult = {

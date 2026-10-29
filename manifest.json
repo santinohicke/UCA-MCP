@@ -2,7 +2,7 @@
   "manifest_version": "0.1",
   "name": "uca-mcp",
   "display_name": "UCA MCP - Asistente Académico",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Conectá EVA Moodle, SIU Guaraní y Campus Autogestión con Claude sin usar la terminal.",
   "author": {
     "name": "Comunidad Estudiantil UCA"
@@ -61,12 +61,28 @@
       "description": "Lista las secciones, módulos, tareas y recursos pertenecientes a un curso en EVA."
     },
     {
+      "name": "eva_cronograma",
+      "description": "Busca el archivo de cronograma o programa de una materia en EVA Moodle y extrae las fechas de parciales, recuperatorios y entregas."
+    },
+    {
+      "name": "eva_entregas_proximas",
+      "description": "Consulta qué tareas, trabajos prácticos o actividades tienen fecha de vencimiento en los próximos días y avisos recientes de cátedra."
+    },
+    {
+      "name": "eva_cuestionarios",
+      "description": "Consulta cuestionarios, exámenes parciales online, fechas de apertura/cierre, intentos y calificaciones en EVA Moodle (Lectura pura)."
+    },
+    {
       "name": "eva_tareas_y_notas",
       "description": "Obtiene tareas, plazos de entrega, estado de entregas y fechas límite en EVA Moodle."
     },
     {
       "name": "eva_foros",
       "description": "Obtiene los últimos avisos institucionales y mensajes de foros de cátedra."
+    },
+    {
+      "name": "eva_hilo_foro",
+      "description": "Obtiene el debate o hilo completo de un foro de cátedra en EVA Moodle, con todas sus respuestas."
     },
     {
       "name": "eva_buscar_materiales",
@@ -85,8 +101,24 @@
       "description": "Publica una respuesta en un foro de cátedra de EVA Moodle (Canal B)."
     },
     {
+      "name": "guarani_progreso_carrera",
+      "description": "Calcula exactamente cuántas materias te faltan para recibirte en SIU Guaraní, cuántas tenés aprobadas, cursando actualmente y materias pendientes por año."
+    },
+    {
+      "name": "guarani_plan_optimo",
+      "description": "Calcula el plan óptimo de cursada rankeando materias por cierre transitivo de correlatividades y camino crítico."
+    },
+    {
+      "name": "guarani_materias_habilitadas",
+      "description": "Calcula qué materias del plan de estudio el alumno está en condiciones de cursar el próximo período según su grafo de correlatividades."
+    },
+    {
       "name": "guarani_estado_cursada",
       "description": "Detalla cursadas activas, horarios, regularidad e inasistencias acumuladas en SIU Guaraní."
+    },
+    {
+      "name": "guarani_horario_semanal",
+      "description": "Consulta el horario semanal de clases estructurado con días, horarios, aulas y comisiones (admite filtro 'hoy')."
     },
     {
       "name": "guarani_historia_academica",
@@ -95,6 +127,18 @@
     {
       "name": "guarani_mesas_disponibles",
       "description": "[EXPERIMENTAL] Mesas de examen final con fechas, turnos, tribunales y condición de inscripción en SIU Guaraní."
+    },
+    {
+      "name": "guarani_mis_inscripciones_examen",
+      "description": "Consulta las inscripciones activas a mesas de examen final y actuaciones provisorias del alumno en SIU Guaraní."
+    },
+    {
+      "name": "guarani_encuestas_pendientes",
+      "description": "Consulta si el alumno tiene encuestas docentes institucionales obligatorias o pendientes de responder en SIU Guaraní."
+    },
+    {
+      "name": "guarani_historial_constancias",
+      "description": "Consulta el historial de solicitudes de constancias y certificados emitidos en SIU Guaraní, con opción de descarga de PDFs."
     },
     {
       "name": "guarani_correlatividades_y_plan",

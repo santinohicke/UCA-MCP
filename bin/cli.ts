@@ -8,7 +8,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const options = {
   help: { type: "boolean" as const, short: "h" },
   version: { type: "boolean" as const, short: "v" },
-  "keep-browser": { type: "boolean" as const }
+  "keep-browser": { type: "boolean" as const },
+  json: { type: "boolean" as const }
 };
 
 const { values, positionals } = parseArgs({
@@ -27,7 +28,7 @@ async function main() {
   }
 
   const unknownFlags = Object.keys(values).filter(
-    (k) => k !== "help" && k !== "version" && k !== "keep-browser"
+    (k) => k !== "help" && k !== "version" && k !== "keep-browser" && k !== "json"
   );
   if (unknownFlags.length > 0) {
     console.error(`Opción desconocida: --${unknownFlags[0]}. Ejecutá 'uca-mcp --help' para ver opciones.`);
@@ -44,7 +45,7 @@ Uso:
 
 Comandos:
   serve                 Inicia el servidor en modo STDIO (por defecto para Claude/Cursor)
-  doctor                Diagnostica el entorno, permisos y rutas
+  doctor [--json]       Diagnostica el entorno, permisos y rutas (texto o JSON)
   login                 Abre el navegador interactivo para iniciar sesión institucional
   status                Consulta el estado de la sesión guardada
   logout                Purga sesión, claves del llavero, caché y navegador (--keep-browser para conservar navegador)
@@ -84,23 +85,52 @@ Comandos:
       }
     };
 
-    console.log("=== Diagnóstico de UCA MCP ===");
-    console.log(`Versión:           ${CONFIG.VERSION}`);
-    console.log(`Node.js:           ${process.version}`);
-    console.log(`Plataforma:        ${process.platform} (${process.arch})`);
-    console.log(`Llavero / Modo:    ${getKeychainMode()}`);
-    if (getKeychainMode() === "windows-scrypt-clm") {
-      console.warn("⚠️  [ADVERTENCIA] PowerShell CLM activo: la clave se deriva del entorno local en vez de DPAPI.");
+    const isJson = Boolean(values.json || process.argv.includes("--json"));
+    const evaPing = await checkPing(CONFIG.EVA_BASE_URL);
+    const guaraniPing = await checkPing(CONFIG.GUARANI_BASE_URL);
+    const campusPing = await checkPing(CONFIG.CAMPUS_BASE_URL);
+
+    if (isJson) {
+      const diagnosis = {
+        version: CONFIG.VERSION,
+        node: process.version,
+        platform: process.platform,
+        arch: process.arch,
+        keychainMode: getKeychainMode(),
+        browser: browserStr,
+        confirmationTool: getConfirmationTool(),
+        baseDir: CONFIG.BASE_DIR,
+        session: {
+          active: Boolean(session),
+          userEmail: session?.userEmail || null,
+          savedAt: session?.savedAt || null
+        },
+        connectivity: {
+          eva: evaPing,
+          guarani: guaraniPing,
+          campus: campusPing
+        }
+      };
+      console.log(JSON.stringify(diagnosis, null, 2));
+    } else {
+      console.log("=== Diagnóstico de UCA MCP ===");
+      console.log(`Versión:           ${CONFIG.VERSION}`);
+      console.log(`Node.js:           ${process.version}`);
+      console.log(`Plataforma:        ${process.platform} (${process.arch})`);
+      console.log(`Llavero / Modo:    ${getKeychainMode()}`);
+      if (getKeychainMode() === "windows-scrypt-clm") {
+        console.warn("⚠️  [ADVERTENCIA] PowerShell CLM activo: la clave se deriva del entorno local en vez de DPAPI.");
+      }
+      console.log(`Navegador:         ${browserStr}`);
+      console.log(`Diálogo Nativo:    ${getConfirmationTool()}`);
+      console.log(`Carpeta de Estado: ${CONFIG.BASE_DIR}`);
+      console.log(`Sesión Cifrada:    ${session ? `Activa (${session.userEmail || "guardada"})` : "No iniciada"}`);
+      console.log("--- Conectividad Institucional ---");
+      console.log(`EVA (Moodle):      ${evaPing}`);
+      console.log(`Guaraní (SIU):     ${guaraniPing}`);
+      console.log(`Campus UCA:        ${campusPing}`);
+      console.log("===============================");
     }
-    console.log(`Navegador:         ${browserStr}`);
-    console.log(`Diálogo Nativo:    ${getConfirmationTool()}`);
-    console.log(`Carpeta de Estado: ${CONFIG.BASE_DIR}`);
-    console.log(`Sesión Cifrada:    ${session ? `Activa (${session.userEmail || "guardada"})` : "No iniciada"}`);
-    console.log("--- Conectividad Institucional ---");
-    console.log(`EVA (Moodle):      ${await checkPing(CONFIG.EVA_BASE_URL)}`);
-    console.log(`Guaraní (SIU):     ${await checkPing(CONFIG.GUARANI_BASE_URL)}`);
-    console.log(`Campus UCA:        ${await checkPing(CONFIG.CAMPUS_BASE_URL)}`);
-    console.log("===============================");
   } else if (command === "status") {
     const { loadEncryptedSession } = await import("../src/auth/session.js");
     const session = loadEncryptedSession();

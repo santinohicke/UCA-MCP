@@ -118,11 +118,17 @@ function downsampleImage(
   return { data: dst, width: newWidth, height: newHeight };
 }
 
+export interface PdfExtractResult {
+  blocks: ExtractedBlock[];
+  totalPaginas: number;
+  proximaPagina?: number;
+}
+
 export async function extractPdfContent(
   buffer: Uint8Array,
   desdePagina = 1,
   maxPages = 15
-): Promise<ExtractedBlock[]> {
+): Promise<PdfExtractResult> {
   const pdfjsLib = await getPdfJs();
   const loadingTask = pdfjsLib.getDocument({
     data: buffer.slice(),
@@ -136,10 +142,11 @@ export async function extractPdfContent(
   const blocks: ExtractedBlock[] = [];
   const MAX_IMAGES_TOTAL = 10;
   let totalImagesExtracted = 0;
+  let endPage = 0;
 
   try {
     const startPage = Math.max(1, desdePagina);
-    const endPage = Math.min(doc.numPages, startPage + maxPages - 1);
+    endPage = Math.min(doc.numPages, startPage + maxPages - 1);
     const MAX_AGGREGATE_IMAGE_BYTES = 3 * 1024 * 1024; // 3 MB tope agregado para imágenes extraídas en base64
     let aggregateImageBytes = 0;
 
@@ -272,5 +279,9 @@ export async function extractPdfContent(
     }
   }
 
-  return blocks;
+  return {
+    blocks,
+    totalPaginas: doc.numPages,
+    proximaPagina: endPage < doc.numPages ? endPage + 1 : undefined
+  };
 }

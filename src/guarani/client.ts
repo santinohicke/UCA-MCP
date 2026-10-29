@@ -3,13 +3,18 @@ import path from "node:path";
 import * as cheerio from "cheerio";
 import { guaraniFetch, guaraniMutex } from "../shared/http.js";
 import { logger } from "../shared/logger.js";
-import { loadEncryptedSession, saveEncryptedSession } from "../auth/session.js";
+import { loadEncryptedSession, saveEncryptedSession, registerSessionPurgeHook } from "../auth/session.js";
 import { withInterProcessLock } from "../auth/session-store.js";
 import { CONFIG } from "../config.js";
 
 // Bloqueo combinado intra-proceso (guaraniMutex) e inter-proceso (guarani.lock)
+// Si ya estamos dentro del mutex (llamada re-entrante), se omite el file lock para evitar deadlock.
 export async function withGuaraniLock<T>(fn: () => Promise<T>): Promise<T> {
   return guaraniMutex.runExclusive(() => {
+    if (guaraniMutex.isInsideLock()) {
+      // Ya estamos en un frame outer con el file lock adquirido; solo ejecutar sin re-adquirir.
+      return fn();
+    }
     const lockPath = path.join(CONFIG.BASE_DIR, "guarani.lock");
     return withInterProcessLock(lockPath, fn);
   });
@@ -167,6 +172,9 @@ export interface PlanEstudiosInfo {
   materias: MateriaPlan[];
   analisisMateria?: MateriaPlan;
   resumenImpacto?: string;
+  analisisCompleto?: boolean;
+  materiasSinVerificar?: number;
+  materiasHabilitadasParaCursar?: MateriaPlan[];
 }
 
 // Desenvuelve respuestas de Guaraní Chulupi (JSON con propiedad {cont} o scripts de renderizado on_arrival)
@@ -220,9 +228,9 @@ export function parseCursadas(html: string): CursadaInfo[] {
 
     let calculoFaltas: CalculoFaltas | undefined;
     if (asistencia) {
-      const pctMatch = /(\d+(?:\.\d+)?)/.exec(asistencia);
+      const pctMatch = /(\d+(?:[.,]\d+)?)/.exec(asistencia);
       if (pctMatch) {
-        calculoFaltas = calcularFaltas(parseFloat(pctMatch[1]), inasistencias || 0);
+        calculoFaltas = calcularFaltas(parseFloat(pctMatch[1].replace(",", ".")), inasistencias || 0);
       }
     }
 
@@ -290,8 +298,8 @@ export function parseReporteInasistencias(html: string): InasistenciasMateriaPar
     const materia = codMatch ? codMatch[2].trim() : leftText;
     const comision = codMatch && codMatch[3] ? codMatch[3].trim() : undefined;
 
-    const pctMatch = /(\d+(?:\.\d+)?)/.exec(rightText);
-    const porcentajeAsistencia = pctMatch ? parseFloat(pctMatch[1]) : 100;
+    const pctMatch = /(\d+(?:[.,]\d+)?)/.exec(rightText);
+    const porcentajeAsistencia = pctMatch ? parseFloat(pctMatch[1].replace(",", ".")) : 100;
 
     const detalles: InasistenciaDetalle[] = [];
     $(el).find("table.comisiones tr").each((__, tr) => {
@@ -317,7 +325,8 @@ export function parseReporteInasistencias(html: string): InasistenciasMateriaPar
       }
     });
 
-    const inasistenciasTotales = detalles.reduce((sum, d) => sum + d.cantidad, 0);
+    // Solo contar las no-justificadas para calcularFaltas (las justificadas no descuentan asistencia)
+    const inasistenciasTotales = detalles.filter((d) => !d.justificada).reduce((sum, d) => sum + d.cantidad, 0);
 
     items.push({
       codigo,
@@ -509,6 +518,19 @@ export function matchMateriaFilter(matNombre: string, targetMateria: string): bo
   return targetTokens.every((token) => matTokens.includes(token));
 }
 
+// Compara dos materias priorizando código exacto cuando ambos están presentes para evitar falsos positivos
+export function matchMateria(
+  codeA?: string,
+  nameA?: string,
+  codeB?: string,
+  nameB?: string
+): boolean {
+  if (codeA && codeB) {
+    return codeA.trim().toLowerCase() === codeB.trim().toLowerCase();
+  }
+  return matchMateriaFilter(nameA || "", nameB || "");
+}
+
 // Parser puro para mesas de examen disponibles
 export function parseMesasExamen(html: string, targetMateria = ""): MesaExamenInfo[] {
   const $ = cheerio.load(html);
@@ -614,8 +636,18 @@ function normalizeCareer(str: string): string {
     .trim();
 }
 
+let carreraActivaVerificada: { nombre: string; checkedAt: number } | null = null;
+
+export function clearCarreraActivaCache(): void {
+  carreraActivaVerificada = null;
+}
+registerSessionPurgeHook(clearCarreraActivaCache);
+
 // Descubre carreras disponibles en Guaraní, descarta cursos auxiliares y conmuta a la carrera académica objetivo
-export async function ensureCarreraActiva(targetCarrera?: string): Promise<{
+export async function ensureCarreraActiva(
+  targetCarrera?: string,
+  forceStrict = false
+): Promise<{
   activa?: string;
   disponibles: string[];
 }> {
@@ -625,10 +657,22 @@ export async function ensureCarreraActiva(targetCarrera?: string): Promise<{
     disponibles = [];
   }
 
+  // Fast path para consultas de lectura si la carrera fue verificada recientemente (< 5 min)
+  if (!forceStrict && carreraActivaVerificada && (Date.now() - carreraActivaVerificada.checkedAt < 5 * 60 * 1000)) {
+    if (!targetCarrera) {
+      return { activa: carreraActivaVerificada.nombre, disponibles: disponibles.map((c) => c.nombre) };
+    }
+    const normTarget = normalizeCareer(targetCarrera);
+    const normActive = normalizeCareer(carreraActivaVerificada.nombre);
+    if (normTarget === normActive || normActive.includes(normTarget)) {
+      return { activa: carreraActivaVerificada.nombre, disponibles: disponibles.map((c) => c.nombre) };
+    }
+  }
+
   if (disponibles.length === 0) {
     try {
-      const res = await guaraniFetch("/inicio_alumno", {
-        headers: { "X-Requested-With": "" }
+      const res = await guaraniFetch("/", {
+        headers: { "X-Requested-With": "", "Accept": "text/html" }
       });
       const html = await readGuaraniText(res);
       const $ = cheerio.load(html);
@@ -672,14 +716,20 @@ export async function ensureCarreraActiva(targetCarrera?: string): Promise<{
     const targetId = match ? match.id : targetCarrera;
     const targetNombre = match ? match.nombre : targetCarrera;
 
+    // Si ya está activa en la sesión, saltear conmutación y verificación para ahorrar 2 requests
+    if (session?.carreraActiva === targetNombre) {
+      carreraActivaVerificada = { nombre: targetNombre, checkedAt: Date.now() };
+      return { activa: targetNombre, disponibles: disponibles.map((c) => c.nombre) };
+    }
+
     const changeRes = await guaraniFetch(`/acceso/cambiar_carrera?id=${encodeURIComponent(targetId)}&op=inicio_alumno`);
     if (!changeRes.ok) {
       throw new Error(`Error al conmutar a la carrera '${targetNombre}' en Guaraní (HTTP ${changeRes.status}).`);
     }
 
     // Verificación estricta del estado activo en el servidor para evitar inscribir en carrera equivocada
-    const verifyRes = await guaraniFetch("/inicio_alumno", {
-      headers: { "X-Requested-With": "" }
+    const verifyRes = await guaraniFetch("/", {
+      headers: { "X-Requested-With": "", "Accept": "text/html" }
     });
     const verifyHtml = await readGuaraniText(verifyRes);
     const activeFromHtml = extractActiveCareerFromHtml(verifyHtml);
@@ -713,12 +763,17 @@ export async function ensureCarreraActiva(targetCarrera?: string): Promise<{
       session.carreraActiva = targetNombre;
       saveEncryptedSession(session);
     }
+    carreraActivaVerificada = { nombre: targetNombre, checkedAt: Date.now() };
     return { activa: targetNombre, disponibles: disponibles.map((c) => c.nombre) };
   }
 
   // 2. Si solo hay 1 carrera de grado/posgrado disponible, conmutar automáticamente para asegurar contexto en Guaraní
   if (disponibles.length === 1) {
     const unica = disponibles[0];
+    if (session?.carreraActiva === unica.nombre) {
+      carreraActivaVerificada = { nombre: unica.nombre, checkedAt: Date.now() };
+      return { activa: unica.nombre, disponibles: [unica.nombre] };
+    }
     try {
       await guaraniFetch(`/acceso/cambiar_carrera?id=${encodeURIComponent(unica.id)}&op=inicio_alumno`);
       if (session) {
@@ -728,14 +783,17 @@ export async function ensureCarreraActiva(targetCarrera?: string): Promise<{
     } catch (err) {
       logger.warn(`Fallo al auto-conmutar a la carrera ${unica.nombre}: ${err}`);
     }
+    carreraActivaVerificada = { nombre: unica.nombre, checkedAt: Date.now() };
     return { activa: unica.nombre, disponibles: [unica.nombre] };
   }
 
   // 3. Múltiples carreras: leer la carrera activa real en el servidor para no etiquetar erróneamente
   let realActiva: string | undefined;
   try {
-    const checkRes = await guaraniFetch("/inicio_alumno");
-    const checkHtml = unwrapChulupiHtml(await readGuaraniText(checkRes));
+    const checkRes = await guaraniFetch("/", {
+      headers: { "X-Requested-With": "", "Accept": "text/html" }
+    });
+    const checkHtml = await readGuaraniText(checkRes);
     realActiva = extractActiveCareerFromHtml(checkHtml);
   } catch {}
 
@@ -744,33 +802,64 @@ export async function ensureCarreraActiva(targetCarrera?: string): Promise<{
     session.carreraActiva = realActiva;
     saveEncryptedSession(session);
   }
+  if (activa) {
+    carreraActivaVerificada = { nombre: activa, checkedAt: Date.now() };
+  }
   return { activa, disponibles: disponibles.map((c) => c.nombre) };
 }
 
+const GUARANI_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos de caché en memoria
+const cursadaCache = new Map<string, { data: CursadaInfo[]; expires: number }>();
+const historiaCache = new Map<string, { data: HistoriaAcademicaInfo; expires: number }>();
+
+export function clearGuaraniCache(): void {
+  cursadaCache.clear();
+  historiaCache.clear();
+}
+registerSessionPurgeHook(clearGuaraniCache);
+
 // 1. Obtener estado de cursadas activas e inasistencias acumuladas
-export async function getEstadoCursada(carrera?: string): Promise<CursadaInfo[]> {
+export async function getEstadoCursada(carrera?: string, forzarRefresco = false): Promise<CursadaInfo[]> {
+  const cacheKey = (carrera || "default").toLowerCase();
+  if (!forzarRefresco) {
+    const cached = cursadaCache.get(cacheKey);
+    if (cached && Date.now() < cached.expires) {
+      return cached.data;
+    }
+  }
+
   return withGuaraniLock(async () => {
     try {
       await ensureCarreraActiva(carrera);
 
-      // 1. Obtener inasistencias detalladas y porcentajes desde /reporte_inasistencias
+      // 1. Obtener inasistencias y cursadas en paralelo
+      const [inasResResult, calResResult] = await Promise.allSettled([
+        guaraniFetch("/reporte_inasistencias"),
+        guaraniFetch("/calendario")
+      ]);
+
       let inasistenciasList: InasistenciasMateriaParsed[] = [];
-      try {
-        const inasRes = await guaraniFetch("/reporte_inasistencias");
-        const inasRaw = await readGuaraniText(inasRes);
-        inasistenciasList = parseReporteInasistencias(unwrapChulupiHtml(inasRaw));
-      } catch (err) {
-        logger.warn(`No se pudo obtener /reporte_inasistencias: ${err}`);
+      if (inasResResult.status === "fulfilled") {
+        try {
+          const inasRaw = await readGuaraniText(inasResResult.value);
+          inasistenciasList = parseReporteInasistencias(unwrapChulupiHtml(inasRaw));
+        } catch (err) {
+          logger.warn(`No se pudo parsear /reporte_inasistencias: ${err}`);
+        }
+      } else {
+        logger.warn(`No se pudo obtener /reporte_inasistencias: ${inasResResult.reason}`);
       }
 
-      // 2. Obtener cursadas activas y horarios desde /calendario
       let cursadas: CursadaInfo[] = [];
-      try {
-        const calRes = await guaraniFetch("/calendario");
-        const calRaw = await readGuaraniText(calRes);
-        cursadas = parseCalendarioAsignaciones(calRaw);
-      } catch (err) {
-        logger.warn(`No se pudo obtener /calendario: ${err}`);
+      if (calResResult.status === "fulfilled") {
+        try {
+          const calRaw = await readGuaraniText(calResResult.value);
+          cursadas = parseCalendarioAsignaciones(calRaw);
+        } catch (err) {
+          logger.warn(`No se pudo parsear /calendario: ${err}`);
+        }
+      } else {
+        logger.warn(`No se pudo obtener /calendario: ${calResResult.reason}`);
       }
 
       // 3. Fallback a /cursada si /calendario vino vacío
@@ -796,10 +885,8 @@ export async function getEstadoCursada(carrera?: string): Promise<CursadaInfo[]>
 
       // 5. Cruzar cursadas con inasistencias y aplicar el cálculo de faltas
       for (const cur of cursadas) {
-        const match = inasistenciasList.find(
-          (ina) =>
-            (cur.codigo && ina.codigo && cur.codigo.toLowerCase() === ina.codigo.toLowerCase()) ||
-            matchMateriaFilter(cur.materia, ina.materia)
+        const match = inasistenciasList.find((ina) =>
+          matchMateria(cur.codigo, cur.materia, ina.codigo, ina.materia)
         );
 
         if (match) {
@@ -818,10 +905,8 @@ export async function getEstadoCursada(carrera?: string): Promise<CursadaInfo[]>
 
       // 6. Asegurar que cualquier materia con inasistencias que no estaba en /calendario esté incluida
       for (const inas of inasistenciasList) {
-        const already = cursadas.some(
-          (c) =>
-            (c.codigo && inas.codigo && c.codigo.toLowerCase() === inas.codigo.toLowerCase()) ||
-            matchMateriaFilter(c.materia, inas.materia)
+        const already = cursadas.some((c) =>
+          matchMateria(c.codigo, c.materia, inas.codigo, inas.materia)
         );
         if (!already) {
           cursadas.push({
@@ -837,6 +922,7 @@ export async function getEstadoCursada(carrera?: string): Promise<CursadaInfo[]>
         }
       }
 
+      cursadaCache.set(cacheKey, { data: cursadas, expires: Date.now() + GUARANI_CACHE_TTL_MS });
       return cursadas;
     } catch (err) {
       logger.error("Error al obtener estado de cursada en Guaraní", err);
@@ -846,12 +932,30 @@ export async function getEstadoCursada(carrera?: string): Promise<CursadaInfo[]>
 }
 
 // 2. Obtener historia académica completa y analítico
-export async function getHistoriaAcademica(carrera?: string): Promise<HistoriaAcademicaInfo> {
+export async function getHistoriaAcademica(carrera?: string, forzarRefresco = false): Promise<HistoriaAcademicaInfo> {
+  const cacheKey = (carrera || "default").toLowerCase();
+  if (!forzarRefresco) {
+    const cached = historiaCache.get(cacheKey);
+    if (cached && Date.now() < cached.expires) {
+      return cached.data;
+    }
+  }
+
   return withGuaraniLock(async () => {
     try {
       const { activa, disponibles } = await ensureCarreraActiva(carrera);
-      const res = await guaraniFetch("/historia_academica");
-      const rawText = await readGuaraniText(res);
+
+      // Lanzar historia académica y porcentaje de avance en paralelo
+      const [histResResult, avanceResResult] = await Promise.allSettled([
+        guaraniFetch("/historia_academica"),
+        guaraniFetch("/porcentaje_avance_carrera")
+      ]);
+
+      if (histResResult.status === "rejected") {
+        throw histResResult.reason;
+      }
+
+      const rawText = await readGuaraniText(histResResult.value);
       const html = unwrapChulupiHtml(rawText);
 
       const parsed = parseHistoriaAcademica(html, {
@@ -859,11 +963,13 @@ export async function getHistoriaAcademica(carrera?: string): Promise<HistoriaAc
         carrerasDisponibles: disponibles.length > 1 ? disponibles : undefined
       });
 
-      // Si no encontró promedios o avance en la vista principal, consultar endpoint dedicado
-      if (parsed.promedioSinAplazos === undefined || parsed.porcentajeAvance === undefined) {
+      // Si no encontró promedios o avance en la vista principal, enriquecer con la respuesta de /porcentaje_avance_carrera
+      if (
+        (parsed.promedioSinAplazos === undefined || parsed.porcentajeAvance === undefined) &&
+        avanceResResult.status === "fulfilled"
+      ) {
         try {
-          const avanceRes = await guaraniFetch("/porcentaje_avance_carrera");
-          const avanceRaw = await readGuaraniText(avanceRes);
+          const avanceRaw = await readGuaraniText(avanceResResult.value);
           let avanceHtml = unwrapChulupiHtml(avanceRaw);
 
           const match = avanceHtml.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/);
@@ -897,6 +1003,7 @@ export async function getHistoriaAcademica(carrera?: string): Promise<HistoriaAc
         }
       }
 
+      historiaCache.set(cacheKey, { data: parsed, expires: Date.now() + GUARANI_CACHE_TTL_MS });
       return parsed;
     } catch (err) {
       logger.error("Error al obtener historia académica en Guaraní", err);
@@ -1096,36 +1203,185 @@ function savePlanCorrelativasCache(cachePath: string, cache: Record<string, unkn
   } catch {}
 }
 
+export interface GraphJob {
+  promise: Promise<void>;
+  done: boolean;
+  total: number;
+  fetched: number;
+  failed: string[];
+}
+
+const inMemoryGraphs = new Map<string, Record<string, { paraCursar: CorrelativaRequisito[]; paraAprobar: CorrelativaRequisito[] }>>();
+const inFlightJobs = new Map<string, GraphJob>();
+
+function getGraph(cachePath: string): Record<string, { paraCursar: CorrelativaRequisito[]; paraAprobar: CorrelativaRequisito[] }> {
+  let graph = inMemoryGraphs.get(cachePath);
+  if (!graph) {
+    graph = loadPlanCorrelativasCache(cachePath);
+    inMemoryGraphs.set(cachePath, graph);
+  }
+  return graph;
+}
+
+export function clearGuaraniGraphCache(): void {
+  inMemoryGraphs.clear();
+  inFlightJobs.clear();
+}
+registerSessionPurgeHook(clearGuaraniGraphCache);
+
+function rankMateria(m: MateriaPlan, priorityIds: string[], targetAnio?: number): number {
+  if (m.elementoId && priorityIds.includes(m.elementoId)) return -100;
+  if (targetAnio !== undefined) {
+    const diff = m.anio - targetAnio;
+    if (diff > 0) return diff;
+    return 10 + Math.abs(diff);
+  }
+  return m.anio;
+}
+
+// Inicia o suscribe a la descarga en segundo plano del grafo completo de correlativas sin cortar por tope
+export function startGraphJob(
+  planInfo: PlanEstudiosInfo,
+  cachePath: string,
+  priorityIds: string[] = [],
+  targetAnio?: number
+): GraphJob {
+  const existing = inFlightJobs.get(cachePath);
+  if (existing && !existing.done) {
+    return existing;
+  }
+
+  const graph = getGraph(cachePath);
+  const missing = planInfo.materias
+    .filter((m) => m.elementoId && m.elementoPadreId && !graph[m.elementoId])
+    .sort((a, b) => {
+      const rankA = rankMateria(a, priorityIds, targetAnio);
+      const rankB = rankMateria(b, priorityIds, targetAnio);
+      if (rankA !== rankB) return rankA - rankB;
+      return a.anio - b.anio;
+    });
+
+  if (missing.length === 0) {
+    return {
+      promise: Promise.resolve(),
+      done: true,
+      total: 0,
+      fetched: 0,
+      failed: []
+    };
+  }
+
+  const job: GraphJob = {
+    promise: Promise.resolve(),
+    done: false,
+    total: missing.length,
+    fetched: 0,
+    failed: []
+  };
+
+  job.promise = (async () => {
+    let qIdx = 0;
+    let dirty = false;
+    // Menor concurrencia (2 en vez de 4) para no acaparar los 4 slots de httpLimiter frente a consultas del usuario
+    const CONCURRENCY = 2;
+    const workers = Array.from({ length: Math.min(CONCURRENCY, missing.length) }, async () => {
+      while (qIdx < missing.length) {
+        const m = missing[qIdx++];
+        try {
+          const body = new URLSearchParams({
+            elemento: m.elementoId!,
+            elemento_padre: m.elementoPadreId!
+          });
+          const corrRes = await guaraniFetch("/plan_estudio/correlativas", {
+            method: "POST",
+            body,
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            priority: "low"
+          });
+          const corrHtml = unwrapChulupiHtml(await readGuaraniText(corrRes));
+          const parsed = parseCorrelativasHtml(corrHtml);
+          graph[m.elementoId!] = parsed;
+          job.fetched++;
+          dirty = true;
+        } catch {
+          job.failed.push(m.nombre);
+        }
+      }
+    });
+
+    await Promise.all(workers);
+    if (dirty) {
+      savePlanCorrelativasCache(cachePath, graph);
+    }
+    job.done = true;
+    inFlightJobs.delete(cachePath);
+  })();
+
+  inFlightJobs.set(cachePath, job);
+  return job;
+}
+
+// Pre-calienta proactivamente el plan de estudios y el grafo de correlatividades sin retener el cerrojo global
+export async function prefetchPlanGraph(carrera?: string): Promise<void> {
+  const session = loadEncryptedSession();
+  if (!session?.siuSession && !session?.cookies) return;
+
+  try {
+    const planInfo = await withGuaraniLock(async () => {
+      await ensureCarreraActiva(carrera);
+      const res = await guaraniFetch("/plan_estudio");
+      const rawText = await readGuaraniText(res);
+      return parsePlanEstudio(unwrapChulupiHtml(rawText));
+    });
+
+    const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
+    const job = startGraphJob(planInfo, cachePath);
+    await job.promise;
+    logger.info(`Grafo de correlatividades pre-calentado con éxito para ${planInfo.propuesta || "carrera activa"}.`);
+  } catch (err) {
+    logger.warn(`No se pudo pre-calentar el grafo de correlatividades: ${err}`);
+  }
+}
+
 // 4. Obtener plan de estudio interactivo y análisis de correlatividades / impacto
 export async function getPlanEstudio(
   carrera?: string,
   targetMateria?: string
 ): Promise<PlanEstudiosInfo> {
-  return withGuaraniLock(async () => {
+  const planInfo = await withGuaraniLock(async () => {
     try {
       await ensureCarreraActiva(carrera);
-      const res = await guaraniFetch("/plan_estudio");
-      const rawText = await readGuaraniText(res);
-      const planInfo = parsePlanEstudio(unwrapChulupiHtml(rawText));
+
+      // Lanzar plan de estudio y calendario en paralelo
+      const [planResResult, calResResult] = await Promise.allSettled([
+        guaraniFetch("/plan_estudio"),
+        guaraniFetch("/calendario")
+      ]);
+
+      if (planResResult.status === "rejected") {
+        throw planResResult.reason;
+      }
+
+      const rawText = await readGuaraniText(planResResult.value);
+      const parsed = parsePlanEstudio(unwrapChulupiHtml(rawText));
 
       // Sincronizar estados de materias cursando actualmente
       try {
         let cursadas: CursadaInfo[] = [];
-        try {
-          const calRes = await guaraniFetch("/calendario");
-          const calRaw = await readGuaraniText(calRes);
-          cursadas = parseCalendarioAsignaciones(calRaw);
-        } catch {}
+        if (calResResult.status === "fulfilled") {
+          try {
+            const calRaw = await readGuaraniText(calResResult.value);
+            cursadas = parseCalendarioAsignaciones(calRaw);
+          } catch {}
+        }
         if (cursadas.length === 0) {
           const cursadasRes = await guaraniFetch("/cursada");
           const cursadasHtml = unwrapChulupiHtml(await readGuaraniText(cursadasRes));
           cursadas = parseCursadas(cursadasHtml);
         }
         for (const c of cursadas) {
-          const match = planInfo.materias.find(
-            (m) =>
-              (c.codigo && m.codigo && c.codigo.toLowerCase() === m.codigo.toLowerCase()) ||
-              matchMateriaFilter(m.nombre, c.materia)
+          const match = parsed.materias.find((m) =>
+            matchMateria(c.codigo, c.materia, m.codigo, m.nombre)
           );
           if (match && match.estado === "Pendiente") {
             match.estado = "Cursando";
@@ -1133,203 +1389,667 @@ export async function getPlanEstudio(
         }
       } catch {}
 
-      if (targetMateria) {
-        const normTarget = normalizeMateria(targetMateria);
-        const mat = planInfo.materias.find(
-          (m) =>
-            normalizeMateria(m.nombre) === normTarget ||
-            m.codigo.toLowerCase() === normTarget.toLowerCase() ||
-            matchMateriaFilter(m.nombre, targetMateria)
-        );
-
-        if (mat) {
-          const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
-          const planCorrCache = loadPlanCorrelativasCache(cachePath);
-          let cacheDirty = false;
-
-          const fetchCorrelativasForElement = async (elementoId: string, elementoPadreId: string) => {
-            if (planCorrCache[elementoId]) {
-              return planCorrCache[elementoId];
-            }
-            const body = new URLSearchParams({
-              elemento: elementoId,
-              elemento_padre: elementoPadreId
-            });
-            const corrRes = await guaraniFetch("/plan_estudio/correlativas", {
-              method: "POST",
-              body,
-              headers: { "Content-Type": "application/x-www-form-urlencoded" }
-            });
-            const corrHtml = unwrapChulupiHtml(await readGuaraniText(corrRes));
-            const parsed = parseCorrelativasHtml(corrHtml);
-            planCorrCache[elementoId] = parsed;
-            cacheDirty = true;
-            return parsed;
-          };
-
-          // 1. Correlativas de la materia consultada
-          if (mat.elementoId && mat.elementoPadreId) {
-            try {
-              const { paraCursar, paraAprobar } = await fetchCorrelativasForElement(
-                mat.elementoId,
-                mat.elementoPadreId
-              );
-
-              // Evaluar cumplimiento de cada correlativa contra el estado del alumno
-              for (const req of paraCursar) {
-                const reqMat = planInfo.materias.find(
-                  (m) =>
-                    (req.codigo && m.codigo === req.codigo) ||
-                    matchMateriaFilter(m.nombre, req.materia)
-                );
-                req.estadoActual = reqMat ? reqMat.estado : "Pendiente";
-                if (req.condicionRequerida === "Regularizada") {
-                  req.cumple =
-                    req.estadoActual === "Regularizada" ||
-                    req.estadoActual === "Aprobada" ||
-                    req.estadoActual === "Promocionada";
-                } else {
-                  req.cumple = req.estadoActual === "Aprobada" || req.estadoActual === "Promocionada";
-                }
-              }
-
-              for (const req of paraAprobar) {
-                const reqMat = planInfo.materias.find(
-                  (m) =>
-                    (req.codigo && m.codigo === req.codigo) ||
-                    matchMateriaFilter(m.nombre, req.materia)
-                );
-                req.estadoActual = reqMat ? reqMat.estado : "Pendiente";
-                req.cumple = req.estadoActual === "Aprobada" || req.estadoActual === "Promocionada";
-              }
-
-              mat.correlativasParaCursar = paraCursar;
-              mat.correlativasParaAprobar = paraAprobar;
-            } catch (err) {
-              logger.warn(`No se pudieron obtener correlativas para ${mat.nombre}: ${err}`);
-            }
-          } else {
-            mat.correlativasParaCursar = [];
-            mat.correlativasParaAprobar = [];
-          }
-
-          // 2. Análisis de impacto a futuro: descubrir qué materias posteriores dependen de esta
-          const materiasDependientes: NonNullable<MateriaPlan["materiasQueDependenDeEsta"]> = [];
-          const candidatasFuturas = planInfo.materias.filter((m) => isPotentialDependent(m, mat));
-          const missingCandidates = candidatasFuturas.filter((c) => !planCorrCache[c.elementoId!]);
-
-          // Limitar a un tope de 25 solicitudes por ejecución y concurrencia 4 para prevenir sobrecarga de Guaraní en caché fría
-          const toFetch = missingCandidates.slice(0, 25);
-          if (toFetch.length > 0) {
-            const CONCURRENCY = 4;
-            let qIdx = 0;
-            const workers = Array.from({ length: Math.min(CONCURRENCY, toFetch.length) }, async () => {
-              while (qIdx < toFetch.length) {
-                const fut = toFetch[qIdx++];
-                try {
-                  await fetchCorrelativasForElement(fut.elementoId!, fut.elementoPadreId!);
-                } catch {}
-              }
-            });
-            await Promise.all(workers);
-          }
-
-          if (cacheDirty) {
-            savePlanCorrelativasCache(cachePath, planCorrCache);
-          }
-
-          for (const fut of candidatasFuturas) {
-            const fCorr = planCorrCache[fut.elementoId!];
-            if (!fCorr) continue;
-
-            const requiereCursar = fCorr.paraCursar.some(
-              (r) =>
-                (r.codigo && r.codigo === mat.codigo) ||
-                matchMateriaFilter(r.materia, mat.nombre)
-            );
-            const requiereAprobar = fCorr.paraAprobar.some(
-              (r) =>
-                (r.codigo && r.codigo === mat.codigo) ||
-                matchMateriaFilter(r.materia, mat.nombre)
-            );
-
-            if (requiereCursar) {
-              if (!materiasDependientes.some((d) => d.codigo === fut.codigo && d.requierePara === "Cursar")) {
-                materiasDependientes.push({
-                  materia: fut.nombre,
-                  codigo: fut.codigo,
-                  anio: fut.anio,
-                  requierePara: "Cursar"
-                });
-              }
-            } else if (requiereAprobar) {
-              if (!materiasDependientes.some((d) => d.codigo === fut.codigo && d.requierePara === "Aprobar")) {
-                materiasDependientes.push({
-                  materia: fut.nombre,
-                  codigo: fut.codigo,
-                  anio: fut.anio,
-                  requierePara: "Aprobar"
-                });
-              }
-            }
-          }
-
-          mat.materiasQueDependenDeEsta = materiasDependientes;
-          planInfo.analisisMateria = mat;
-
-          // Construir resumen de impacto en lenguaje natural
-          const cursarOk =
-            !mat.correlativasParaCursar ||
-            mat.correlativasParaCursar.length === 0 ||
-            mat.correlativasParaCursar.every((r) => r.cumple);
-          const aprobarOk =
-            !mat.correlativasParaAprobar ||
-            mat.correlativasParaAprobar.length === 0 ||
-            mat.correlativasParaAprobar.every((r) => r.cumple);
-
-          const lines: string[] = [];
-          lines.push(`Materia: ${mat.nombre} (${mat.codigo}) - Estado actual: ${mat.estado}`);
-          if (mat.correlativasParaCursar && mat.correlativasParaCursar.length > 0) {
-            lines.push(
-              `Requisitos para CURSAR (${cursarOk ? "HABILITADO" : "TRABADO"}): ` +
-                mat.correlativasParaCursar
-                  .map((r) => `${r.materia} (${r.condicionRequerida}) [${r.cumple ? "CUMPLE" : "ADEUDA"}]`)
-                  .join(", ")
-            );
-          } else {
-            lines.push("Requisitos para CURSAR: Ninguno (sin correlativas previas).");
-          }
-
-          if (mat.correlativasParaAprobar && mat.correlativasParaAprobar.length > 0) {
-            lines.push(
-              `Requisitos para APROBAR FINAL (${aprobarOk ? "HABILITADO" : "TRABADO"}): ` +
-                mat.correlativasParaAprobar
-                  .map((r) => `${r.materia} (${r.condicionRequerida}) [${r.cumple ? "CUMPLE" : "ADEUDA"}]`)
-                  .join(", ")
-            );
-          } else {
-            lines.push("Requisitos para APROBAR FINAL: Ninguno (sin correlativas previas).");
-          }
-
-          if (materiasDependientes.length > 0) {
-            lines.push(
-              `Impacto a futuro (materias que trabaría si no se aprueba): ` +
-                materiasDependientes
-                  .map((d) => `${d.materia} (${d.codigo}, ${d.anio}° Año - para ${d.requierePara})`)
-                  .join(", ")
-            );
-          } else {
-            lines.push("Impacto a futuro: No es correlativa directa de materias posteriores del plan.");
-          }
-
-          planInfo.resumenImpacto = lines.join("\n");
-        }
-      }
-
-      return planInfo;
+      return parsed;
     } catch (err) {
       logger.error("Error al obtener plan de estudio en Guaraní", err);
       throw err;
     }
   });
+
+  const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
+  let graph = getGraph(cachePath);
+
+  // Calcular qué materias pendientes se encuentran habilitadas para cursar el próximo período
+  planInfo.materiasHabilitadasParaCursar = planInfo.materias.filter((m) => {
+    if (m.estado !== "Pendiente") return false;
+    const corr = m.elementoId ? graph[m.elementoId] : null;
+    if (!corr || !corr.paraCursar || corr.paraCursar.length === 0) {
+      return true;
+    }
+    return corr.paraCursar.every((req) => {
+      const reqMat = planInfo.materias.find((p) =>
+        matchMateria(req.codigo, req.materia, p.codigo, p.nombre)
+      );
+      if (!reqMat) return false;
+      if (req.condicionRequerida === "Regularizada") {
+        return reqMat.estado === "Regularizada" || reqMat.estado === "Aprobada" || reqMat.estado === "Promocionada";
+      }
+      return reqMat.estado === "Aprobada" || reqMat.estado === "Promocionada";
+    });
+  });
+
+  if (!targetMateria) {
+    // Si solo consultó el plan general, pre-calentar el grafo en segundo plano para consultas posteriores
+    startGraphJob(planInfo, cachePath);
+    return planInfo;
+  }
+
+  const normTarget = normalizeMateria(targetMateria);
+  // Priorizar coincidencia exacta (nombre normalizado o código) antes de matching parcial
+  const mat =
+    planInfo.materias.find(
+      (m) => normalizeMateria(m.nombre) === normTarget || m.codigo.toLowerCase() === normTarget.toLowerCase()
+    ) ||
+    planInfo.materias.find((m) => matchMateriaFilter(m.nombre, targetMateria));
+
+  if (!mat) {
+    return planInfo;
+  }
+
+  const priorityIds = [mat.elementoId].filter(Boolean) as string[];
+  const job = startGraphJob(planInfo, cachePath, priorityIds, mat.anio);
+
+  // Esperar hasta 3.5s por el pool de correlativas para no bloquear la respuesta en clientes MCP
+  await Promise.race([job.promise, new Promise((resolve) => setTimeout(resolve, 3500))]);
+
+  graph = getGraph(cachePath);
+
+  // 1. Correlativas de la materia consultada
+  if (mat.elementoId && graph[mat.elementoId]) {
+    const { paraCursar, paraAprobar } = graph[mat.elementoId];
+
+    mat.correlativasParaCursar = paraCursar.map((req) => {
+      const reqMat = planInfo.materias.find((m) =>
+        matchMateria(req.codigo, req.materia, m.codigo, m.nombre)
+      );
+      const estadoActual = reqMat ? reqMat.estado : "Pendiente";
+      const cumple =
+        req.condicionRequerida === "Regularizada"
+          ? estadoActual === "Regularizada" || estadoActual === "Aprobada" || estadoActual === "Promocionada"
+          : estadoActual === "Aprobada" || estadoActual === "Promocionada";
+      return { ...req, estadoActual, cumple };
+    });
+
+    mat.correlativasParaAprobar = paraAprobar.map((req) => {
+      const reqMat = planInfo.materias.find((m) =>
+        matchMateria(req.codigo, req.materia, m.codigo, m.nombre)
+      );
+      const estadoActual = reqMat ? reqMat.estado : "Pendiente";
+      const cumple = estadoActual === "Aprobada" || estadoActual === "Promocionada";
+      return { ...req, estadoActual, cumple };
+    });
+  } else {
+    mat.correlativasParaCursar = [];
+    mat.correlativasParaAprobar = [];
+  }
+
+  // 2. Análisis de impacto a futuro: descubrir qué materias posteriores dependen de esta
+  const materiasDependientes: NonNullable<MateriaPlan["materiasQueDependenDeEsta"]> = [];
+  const candidatasFuturas = planInfo.materias.filter((m) => isPotentialDependent(m, mat));
+  const materiasSinVerificar = candidatasFuturas.filter((c) => !graph[c.elementoId!]).length;
+  const analisisCompleto = materiasSinVerificar === 0 && job.failed.length === 0;
+
+  for (const fut of candidatasFuturas) {
+    const fCorr = graph[fut.elementoId!];
+    if (!fCorr) continue;
+
+    const requiereCursar = fCorr.paraCursar.some((r) =>
+      matchMateria(r.codigo, r.materia, mat.codigo, mat.nombre)
+    );
+    const requiereAprobar = fCorr.paraAprobar.some((r) =>
+      matchMateria(r.codigo, r.materia, mat.codigo, mat.nombre)
+    );
+
+    if (requiereCursar) {
+      if (!materiasDependientes.some((d) => d.codigo === fut.codigo && d.requierePara === "Cursar")) {
+        materiasDependientes.push({
+          materia: fut.nombre,
+          codigo: fut.codigo,
+          anio: fut.anio,
+          requierePara: "Cursar"
+        });
+      }
+    } else if (requiereAprobar) {
+      if (!materiasDependientes.some((d) => d.codigo === fut.codigo && d.requierePara === "Aprobar")) {
+        materiasDependientes.push({
+          materia: fut.nombre,
+          codigo: fut.codigo,
+          anio: fut.anio,
+          requierePara: "Aprobar"
+        });
+      }
+    }
+  }
+
+  mat.materiasQueDependenDeEsta = materiasDependientes;
+  planInfo.analisisMateria = mat;
+  planInfo.analisisCompleto = analisisCompleto;
+  planInfo.materiasSinVerificar = materiasSinVerificar;
+
+  // Construir resumen de impacto en lenguaje natural
+  const cursarOk =
+    !mat.correlativasParaCursar ||
+    mat.correlativasParaCursar.length === 0 ||
+    mat.correlativasParaCursar.every((r) => r.cumple);
+  const aprobarOk =
+    !mat.correlativasParaAprobar ||
+    mat.correlativasParaAprobar.length === 0 ||
+    mat.correlativasParaAprobar.every((r) => r.cumple);
+
+  const lines: string[] = [];
+  lines.push(`Materia: ${mat.nombre} (${mat.codigo}) - Estado actual: ${mat.estado}`);
+  if (mat.correlativasParaCursar && mat.correlativasParaCursar.length > 0) {
+    lines.push(
+      `Requisitos para CURSAR (${cursarOk ? "HABILITADO" : "TRABADO"}): ` +
+        mat.correlativasParaCursar
+          .map((r) => `${r.materia} (${r.condicionRequerida}) [${r.cumple ? "CUMPLE" : "ADEUDA"}]`)
+          .join(", ")
+    );
+  } else {
+    lines.push("Requisitos para CURSAR: Ninguno (sin correlativas previas).");
+  }
+
+  if (mat.correlativasParaAprobar && mat.correlativasParaAprobar.length > 0) {
+    lines.push(
+      `Requisitos para APROBAR FINAL (${aprobarOk ? "HABILITADO" : "TRABADO"}): ` +
+        mat.correlativasParaAprobar
+          .map((r) => `${r.materia} (${r.condicionRequerida}) [${r.cumple ? "CUMPLE" : "ADEUDA"}]`)
+          .join(", ")
+    );
+  } else {
+    lines.push("Requisitos para APROBAR FINAL: Ninguno (sin correlativas previas).");
+  }
+
+  const verificadas = candidatasFuturas.length - materiasSinVerificar;
+  if (materiasDependientes.length > 0) {
+    const dependientesStr = materiasDependientes
+      .map((d) => `${d.materia} (${d.codigo}, ${d.anio}° Año - para ${d.requierePara})`)
+      .join(", ");
+    if (analisisCompleto) {
+      lines.push(`Impacto a futuro (materias que trabaría si no se aprueba): ${dependientesStr}`);
+    } else {
+      lines.push(
+        `Impacto a futuro (análisis preliminar: ${verificadas}/${candidatasFuturas.length} materias verificadas): ${dependientesStr}\n` +
+          `⚠️ [Análisis preliminar]: Quedan ${materiasSinVerificar} materias posteriores en proceso de verificación en segundo plano. Reintentá en unos segundos para el resultado definitivo.`
+      );
+    }
+  } else {
+    if (analisisCompleto) {
+      lines.push("Impacto a futuro: No es correlativa directa de materias posteriores del plan.");
+    } else {
+      lines.push(
+        `Impacto a futuro: No se identificaron materias dependientes en las ${verificadas} materias verificadas hasta el momento.\n` +
+          `⚠️ [Análisis preliminar]: Quedan ${materiasSinVerificar} materias posteriores en proceso de verificación en segundo plano. Reintentá en unos segundos para confirmar si alguna depende de esta.`
+      );
+    }
+  }
+
+  planInfo.resumenImpacto = lines.join("\n");
+  return planInfo;
+}
+
+export interface MisInscripcionesResult {
+  inscripciones: MesaExamenInfo[];
+  mensaje: string;
+}
+
+// 5. Consultar inscripciones activas a mesas de examen final (en /actuacion_provisoria o /inscripcion_examen)
+export async function getMisInscripcionesExamen(carrera?: string): Promise<MisInscripcionesResult> {
+  return withGuaraniLock(async () => {
+    await ensureCarreraActiva(carrera);
+
+    const inscripciones: MesaExamenInfo[] = [];
+
+    // 1. Consultar /actuacion_provisoria (página oficial de exámenes y promociones en curso)
+    try {
+      const provRes = await guaraniFetch("/actuacion_provisoria");
+      const provRaw = await readGuaraniText(provRes);
+      const provHtml = unwrapChulupiHtml(provRaw);
+
+      if (!provHtml.includes("No hay información sobre actuaciones provisorias en exámenes") && !provHtml.includes("No hay informaci\\u00f3n")) {
+        const parsed = parseMesasExamen(provHtml);
+        inscripciones.push(...parsed);
+      }
+    } catch {}
+
+    // 2. Si la inscripción a examen está abierta, consultar también /inscripcion_examen
+    try {
+      const insRes = await guaraniFetch("/inscripcion_examen");
+      const insRaw = await readGuaraniText(insRes);
+      const insHtml = unwrapChulupiHtml(insRaw);
+      if (!insRaw.includes('"cod":"-2"') && !insHtml.includes("No hay llamados")) {
+        const $ = cheerio.load(insHtml);
+        $(".mesa-inscripta, tr.inscripto, .item-inscripto").each((_, el) => {
+          const matNombre = $(el).find(".materia, td.materia, h4").first().text().trim();
+          const rawFecha = $(el).find(".fecha, td.fecha").first().text().trim() || undefined;
+          const rawHora = $(el).find(".hora, td.hora").first().text().trim() || undefined;
+          const tribunal = $(el).find(".tribunal, td.tribunal").first().text().trim() || undefined;
+          if (matNombre && !inscripciones.some((i) => i.materia === matNombre)) {
+            inscripciones.push({
+              materia: matNombre,
+              llamadoId: $(el).attr("data-llamado") || `inscripta_${matNombre}`,
+              fecha: rawFecha,
+              hora: rawHora,
+              tribunal,
+              inscripcionAbierta: true,
+              condicionPermitida: "Regular"
+            });
+          }
+        });
+      }
+    } catch {}
+
+    const mensaje =
+      inscripciones.length > 0
+        ? `Se encontraron ${inscripciones.length} inscripción(es) a examen final en SIU Guaraní.`
+        : "No registrás inscripciones activas a mesas de examen final en SIU Guaraní.";
+
+    return { inscripciones, mensaje };
+  });
+}
+
+export interface EncuestaPendienteItem {
+  titulo: string;
+  materia?: string;
+  url?: string;
+}
+
+export interface EncuestasPendientesResult {
+  hayPendientes: boolean;
+  encuestas: EncuestaPendienteItem[];
+  mensaje: string;
+}
+
+// 6. Consultar encuestas docentes pendientes en SIU Guaraní (desde el pagelet institucional de /inicio_alumno)
+export async function getEncuestasPendientes(carrera?: string): Promise<EncuestasPendientesResult> {
+  return withGuaraniLock(async () => {
+    await ensureCarreraActiva(carrera);
+
+    const res = await guaraniFetch("/inicio_alumno");
+    const raw = await readGuaraniText(res);
+
+    let encuestasContent = "";
+    const match = raw.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/g);
+    if (match) {
+      for (const m of match) {
+        if (m.includes("lista_encuestas_pendientes")) {
+          try {
+            const jsonStr = m.replace(/^kernel\.renderer\.on_arrival\(/, "").replace(/\);$/, "");
+            const parsed = JSON.parse(jsonStr);
+            if (parsed.content) encuestasContent = parsed.content;
+          } catch {}
+        }
+      }
+    }
+
+    if (!encuestasContent) {
+      encuestasContent = unwrapChulupiHtml(raw);
+    }
+
+    const $ = cheerio.load(encuestasContent);
+    const encuestas: EncuestaPendienteItem[] = [];
+
+    $("a[href*='encuesta'], li.encuesta, .item-encuesta").each((_, el) => {
+      const text = $(el).text().replace(/\s+/g, " ").trim();
+      const href = $(el).attr("href");
+      if (text && !text.includes("No hay encuestas")) {
+        encuestas.push({
+          titulo: text,
+          url: href ? new URL(href, CONFIG.GUARANI_BASE_URL).href : undefined
+        });
+      }
+    });
+
+    const hayPendientes = encuestas.length > 0;
+    const mensaje = hayPendientes
+      ? `Tenés ${encuestas.length} encuesta(s) docente(s) pendiente(s) por responder en SIU Guaraní.`
+      : "No hay encuestas pendientes para completar en SIU Guaraní.";
+
+    return {
+      hayPendientes,
+      encuestas,
+      mensaje
+    };
+  });
+}
+
+export interface ProgresoCarreraInfo {
+  carrera?: string;
+  plan?: string;
+  totalMaterias: number;
+  aprobadas: number;
+  faltantesParaRecibirse: number;
+  cursando: number;
+  regularizadas: number;
+  porcentajeAvance?: number;
+  materiasEnCurso: string[];
+  materiasRestantesPorAnio: Record<number, string[]>;
+  mensaje: string;
+}
+
+// 7. Calcular cuántas materias faltan para recibirse y el desglose de avance de carrera en SIU Guaraní
+export async function getProgresoCarrera(carrera?: string): Promise<ProgresoCarreraInfo> {
+  const planInfo = await getPlanEstudio(carrera);
+  const totalMaterias = planInfo.materias.length;
+
+  const aprobadasList = planInfo.materias.filter((m) => m.estado === "Aprobada" || m.estado === "Promocionada");
+  const cursandoList = planInfo.materias.filter((m) => m.estado === "Cursando");
+  const regularizadasList = planInfo.materias.filter((m) => m.estado === "Regularizada");
+  const restantesList = planInfo.materias.filter((m) => m.estado !== "Aprobada" && m.estado !== "Promocionada");
+
+  const materiasRestantesPorAnio: Record<number, string[]> = {};
+  for (const m of restantesList) {
+    if (!materiasRestantesPorAnio[m.anio]) {
+      materiasRestantesPorAnio[m.anio] = [];
+    }
+    const estadoExtra = m.estado === "Cursando" ? " (Cursando)" : m.estado === "Regularizada" ? " (Regularizada)" : "";
+    materiasRestantesPorAnio[m.anio].push(`${m.nombre} [${m.codigo}]${estadoExtra}`);
+  }
+
+  const porcentaje = totalMaterias > 0 ? Math.round((aprobadasList.length / totalMaterias) * 1000) / 10 : 0;
+  const carreraNom = planInfo.propuesta || carrera || "tu carrera";
+  const mensaje = `Te faltan ${restantesList.length} materias para recibirte (tenés ${aprobadasList.length} aprobadas de ${totalMaterias} materias en total en ${carreraNom}, con ${cursandoList.length} cursando actualmente).`;
+
+  return {
+    carrera: carreraNom,
+    plan: planInfo.plan,
+    totalMaterias,
+    aprobadas: aprobadasList.length,
+    faltantesParaRecibirse: restantesList.length,
+    cursando: cursandoList.length,
+    regularizadas: regularizadasList.length,
+    porcentajeAvance: porcentaje,
+    materiasEnCurso: cursandoList.map((m) => `${m.nombre} [${m.codigo}]`),
+    materiasRestantesPorAnio,
+    mensaje
+  };
+}
+
+export interface ClaseHorario {
+  materia: string;
+  codigo?: string;
+  comision?: string;
+  dia: string;
+  diaNumero: number;
+  desde: string;
+  hasta: string;
+  tipoClase?: string;
+  aula?: string;
+  docentes?: string;
+}
+
+export interface HorarioSemanalInfo {
+  carrera?: string;
+  totalClasesSemana: number;
+  diaFiltrado?: string;
+  clases: ClaseHorario[];
+  agendaPorDia: Record<string, ClaseHorario[]>;
+  mensaje: string;
+}
+
+const DIAS_NOMBRE_MAP: Record<string, string> = {
+  "1": "Domingo",
+  "2": "Lunes",
+  "3": "Martes",
+  "4": "Miércoles",
+  "5": "Jueves",
+  "6": "Viernes",
+  "7": "Sábado"
+};
+
+// Parser puro de horario semanal y asignaciones de clases
+export function parseHorarioSemanal(rawText: string): ClaseHorario[] {
+  let asignaciones: any[] = [];
+  try {
+    let cont = rawText;
+    try {
+      const j = JSON.parse(rawText);
+      if (typeof j?.cont === "string") cont = j.cont;
+    } catch {}
+    const match = cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);\s*<\/script>/) ||
+      cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/);
+    if (match) {
+      const data = JSON.parse(match[1]);
+      if (Array.isArray(data?.info?.asignaciones)) {
+        asignaciones = data.info.asignaciones;
+      }
+    }
+  } catch {}
+
+  const clases: ClaseHorario[] = [];
+  for (const asig of asignaciones) {
+    const matName = asig.NOMBRE_MATERIA?.trim();
+    if (!matName) continue;
+    const diaNum = parseInt(asig.DIA_SEMANA, 10) || 0;
+    const dia = DIAS_NOMBRE_MAP[asig.DIA_SEMANA] || `Día ${asig.DIA_SEMANA || "?"}`;
+    const desde = asig.HS_COMIENZO_CLASE?.slice(0, 5) || "";
+    const hasta = asig.HS_FINALIZ_CLASE?.slice(0, 5) || "";
+
+    clases.push({
+      materia: matName,
+      codigo: asig.MATERIA?.trim() || undefined,
+      comision: asig.NOMBRE?.trim() || undefined,
+      dia,
+      diaNumero: diaNum,
+      desde,
+      hasta,
+      tipoClase: asig.TIPO_CLASE?.trim() || undefined,
+      aula: asig.AULA?.trim() || undefined,
+      docentes: asig.DOCENTES?.trim() || undefined
+    });
+  }
+
+  // Ordenar cronológicamente por día de la semana (Lunes a Sábado) y luego por hora de inicio
+  clases.sort((a, b) => {
+    const dA = a.diaNumero === 1 ? 8 : a.diaNumero; // Domingo al final
+    const dB = b.diaNumero === 1 ? 8 : b.diaNumero;
+    if (dA !== dB) return dA - dB;
+    return (a.desde || "").localeCompare(b.desde || "");
+  });
+
+  return clases;
+}
+
+// 8. Consultar horario semanal estructurado y clases del día ("¿Qué tengo hoy?")
+export async function getHorarioSemanal(carrera?: string, diaFiltro?: string): Promise<HorarioSemanalInfo> {
+  const { activa } = await ensureCarreraActiva(carrera);
+  const calRes = await guaraniFetch("/calendario");
+  const calRaw = await readGuaraniText(calRes);
+  const todasClases = parseHorarioSemanal(calRaw);
+
+  let diaTarget: string | undefined;
+  if (diaFiltro) {
+    const dfLower = diaFiltro.toLowerCase().trim();
+    if (dfLower === "hoy" || dfLower === "today") {
+      const hoyStr = new Date().toLocaleDateString("es-AR", {
+        weekday: "long",
+        timeZone: "America/Argentina/Buenos_Aires"
+      });
+      diaTarget = hoyStr.charAt(0).toUpperCase() + hoyStr.slice(1).toLowerCase();
+      // Normalizar acento en Miércoles
+      if (diaTarget.toLowerCase().startsWith("miercol")) diaTarget = "Miércoles";
+      if (diaTarget.toLowerCase().startsWith("sabad")) diaTarget = "Sábado";
+    } else {
+      const match = Object.values(DIAS_NOMBRE_MAP).find((d) => d.toLowerCase().startsWith(dfLower.slice(0, 3)));
+      diaTarget = match || diaFiltro;
+    }
+  }
+
+  const clasesFiltradas = diaTarget
+    ? todasClases.filter((c) => c.dia.toLowerCase() === diaTarget!.toLowerCase())
+    : todasClases;
+
+  const agendaPorDia: Record<string, ClaseHorario[]> = {};
+  for (const c of clasesFiltradas) {
+    if (!agendaPorDia[c.dia]) agendaPorDia[c.dia] = [];
+    agendaPorDia[c.dia].push(c);
+  }
+
+  let mensaje: string;
+  if (diaTarget) {
+    if (clasesFiltradas.length > 0) {
+      mensaje = `${diaFiltro?.toLowerCase() === "hoy" ? "Hoy " : ""}${diaTarget} tenés ${clasesFiltradas.length} clase(s):\n` +
+        clasesFiltradas.map((c) => `· ${c.materia} (${c.desde} a ${c.hasta})${c.aula ? ` - Aula: ${c.aula}` : ""}${c.tipoClase ? ` [${c.tipoClase}]` : ""}`).join("\n");
+    } else {
+      mensaje = `${diaFiltro?.toLowerCase() === "hoy" ? "Hoy " : ""}${diaTarget} no tenés clases programadas en SIU Guaraní.`;
+    }
+  } else {
+    mensaje = todasClases.length > 0
+      ? `Tenés ${todasClases.length} clase(s) programada(s) en la semana para ${activa || "tu carrera"}.`
+      : "No se encontraron clases programadas en el calendario de cursada.";
+  }
+
+  return {
+    carrera: activa,
+    totalClasesSemana: todasClases.length,
+    diaFiltrado: diaTarget,
+    clases: clasesFiltradas,
+    agendaPorDia,
+    mensaje
+  };
+}
+
+export interface MateriaRankingOptimo {
+  nombre: string;
+  codigo: string;
+  anio: number;
+  periodo: string;
+  desbloqueosDirectos: string[];
+  totalDesbloqueosTransitivas: number;
+  desbloqueosTransitivas: string[];
+  alturaCaminoCritico: number;
+}
+
+export interface PlanOptimoInfo {
+  carrera?: string;
+  plan?: string;
+  totalMateriasPendientes: number;
+  cuatrimestresMinimosEstimados: number;
+  materiasHabilitadasRanking: MateriaRankingOptimo[];
+  sugerenciaProximoCuatrimestre: string[];
+  mensaje: string;
+}
+
+// 9. Plan óptimo de cursada: ranking por cierre transitivo de correlatividades y camino crítico
+export async function getPlanOptimo(carrera?: string, maxMateriasSugeridas = 5): Promise<PlanOptimoInfo> {
+  const planInfo = await getPlanEstudio(carrera);
+  const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
+  const graph = getGraph(cachePath);
+
+  const pendientes = new Map<string, MateriaPlan>();
+  for (const m of planInfo.materias) {
+    if (m.estado !== "Aprobada" && m.estado !== "Promocionada") {
+      pendientes.set(m.codigo || m.nombre, m);
+    }
+  }
+
+  // Construir grafo de dependencias hacia adelante (X desbloquea a Y)
+  const forwardGraph = new Map<string, Set<string>>();
+  for (const m of planInfo.materias) {
+    const keyM = m.codigo || m.nombre;
+    if (!forwardGraph.has(keyM)) forwardGraph.set(keyM, new Set());
+
+    if (m.elementoId && graph[m.elementoId]) {
+      const reqs = [...(graph[m.elementoId].paraCursar || []), ...(graph[m.elementoId].paraAprobar || [])];
+      for (const req of reqs) {
+        const matReq = planInfo.materias.find(
+          (mat) => (req.codigo && mat.codigo === req.codigo) || matchMateriaFilter(mat.nombre, req.materia)
+        );
+        if (matReq) {
+          const keyReq = matReq.codigo || matReq.nombre;
+          if (!forwardGraph.has(keyReq)) forwardGraph.set(keyReq, new Set());
+          forwardGraph.get(keyReq)!.add(keyM);
+        }
+      }
+    }
+  }
+
+  // Memoización para altura del camino crítico (DAG DFS)
+  const alturaMemo = new Map<string, number>();
+  const visiting = new Set<string>();
+
+  const getAltura = (key: string): number => {
+    if (alturaMemo.has(key)) return alturaMemo.get(key)!;
+    if (visiting.has(key)) return 1; // Prevenir ciclos
+    visiting.add(key);
+
+    let maxHijo = 0;
+    const hijos = forwardGraph.get(key) || new Set();
+    for (const h of hijos) {
+      if (pendientes.has(h)) {
+        maxHijo = Math.max(maxHijo, getAltura(h));
+      }
+    }
+    visiting.delete(key);
+    const alt = 1 + maxHijo;
+    alturaMemo.set(key, alt);
+    return alt;
+  };
+
+  const habilitadasKeys = new Set(planInfo.materiasHabilitadasParaCursar?.map((h) => h.codigo || h.nombre) || []);
+  const ranking: MateriaRankingOptimo[] = [];
+
+  for (const key of habilitadasKeys) {
+    const mat = pendientes.get(key);
+    if (!mat) continue;
+
+    // Cierre transitivo vía BFS
+    const visitados = new Set<string>();
+    const queue = Array.from(forwardGraph.get(key) || []);
+    while (queue.length > 0) {
+      const nextKey = queue.shift()!;
+      if (!visitados.has(nextKey) && pendientes.has(nextKey)) {
+        visitados.add(nextKey);
+        for (const grandchild of forwardGraph.get(nextKey) || []) {
+          if (!visitados.has(grandchild)) queue.push(grandchild);
+        }
+      }
+    }
+
+    const directasPendientes = Array.from(forwardGraph.get(key) || [])
+      .filter((k) => pendientes.has(k))
+      .map((k) => pendientes.get(k)?.nombre || k);
+
+    const transitivasPendientes = Array.from(visitados).map((k) => pendientes.get(k)?.nombre || k);
+    const altura = getAltura(key);
+
+    ranking.push({
+      nombre: mat.nombre,
+      codigo: mat.codigo,
+      anio: mat.anio,
+      periodo: mat.periodo,
+      desbloqueosDirectos: directasPendientes,
+      totalDesbloqueosTransitivas: transitivasPendientes.length,
+      desbloqueosTransitivas: transitivasPendientes,
+      alturaCaminoCritico: altura
+    });
+  }
+
+  // Ordenar materias habilitadas:
+  // 1. Mayor altura en el camino crítico (destraban cadenas largas de correlatividades)
+  // 2. Mayor cantidad de materias desbloqueadas a futuro
+  // 3. Menor año y período (priorizar materias base del plan)
+  ranking.sort((a, b) => {
+    if (b.alturaCaminoCritico !== a.alturaCaminoCritico) {
+      return b.alturaCaminoCritico - a.alturaCaminoCritico;
+    }
+    if (b.totalDesbloqueosTransitivas !== a.totalDesbloqueosTransitivas) {
+      return b.totalDesbloqueosTransitivas - a.totalDesbloqueosTransitivas;
+    }
+    return a.anio - b.anio;
+  });
+
+  const maxAltura = ranking.length > 0 ? Math.max(...ranking.map((r) => r.alturaCaminoCritico)) : 0;
+  const cuatrimestresEstimados = Math.max(maxAltura, Math.ceil(pendientes.size / 5));
+
+  const sugeridas = ranking.slice(0, maxMateriasSugeridas).map((r) => `${r.nombre} (${r.codigo}) - Año ${r.anio}`);
+
+  const mensaje = ranking.length > 0
+    ? `Análisis de ruta crítica para ${planInfo.propuesta || "tu carrera"}:\n` +
+      `· Materias pendientes: ${pendientes.size}\n` +
+      `· Cuatrimestres mínimos estimados hasta recibirse: ~${cuatrimestresEstimados} cuatrimestre(s) (según cadena crítica de correlativas).\n` +
+      `· Materia más crítica para cursar primero: '${ranking[0].nombre}' (cadena de ${ranking[0].alturaCaminoCritico} materias sucesivas, desbloquea ${ranking[0].totalDesbloqueosTransitivas} a futuro).\n` +
+      `· Cursada sugerida próxima (${sugeridas.length} materias):\n` +
+      sugeridas.map((s, idx) => `  ${idx + 1}. ${s}`).join("\n")
+    : `No tenés materias pendientes habilitadas para cursar en ${planInfo.propuesta || "tu carrera"}.`;
+
+  return {
+    carrera: planInfo.propuesta,
+    plan: planInfo.plan,
+    totalMateriasPendientes: pendientes.size,
+    cuatrimestresMinimosEstimados: cuatrimestresEstimados,
+    materiasHabilitadasRanking: ranking,
+    sugerenciaProximoCuatrimestre: sugeridas,
+    mensaje
+  };
 }

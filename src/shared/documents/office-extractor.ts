@@ -199,3 +199,52 @@ export function extractXlsxText(buffer: Uint8Array): string {
 
   return output.join("\n\n");
 }
+
+// Extrae texto de documentos OpenDocument (.odt, .ods, .odp) mediante content.xml
+export function extractOdfText(buffer: Uint8Array): string {
+  const files = unzipFiltered(buffer, /^content\.xml$/);
+  const docFile = files["content.xml"];
+  if (!docFile) {
+    throw new Error("Estructura de documento OpenDocument inválida (falta content.xml).");
+  }
+
+  const xml = fflate.strFromU8(docFile);
+  const $ = cheerio.load(xml, { xmlMode: true });
+  const lines: string[] = [];
+
+  $("text\\:p, text\\:h, table\\:table-row").each((_, el) => {
+    if (el.name === "table:table-row") {
+      const rowCells: string[] = [];
+      $(el).find("table\\:table-cell").each((__, cell) => {
+        const text = $(cell).text().trim();
+        if (text) rowCells.push(text);
+      });
+      if (rowCells.length > 0) lines.push(rowCells.join(" | "));
+    } else {
+      if ($(el).parents("table\\:table-row").length > 0) return;
+      const text = $(el).text().trim();
+      if (text) lines.push(text);
+    }
+  });
+
+  return lines.join("\n\n");
+}
+
+// Valida magic bytes para determinar el mimeType real de imágenes
+export function detectImageMimeType(buffer: Uint8Array): string | null {
+  if (buffer.length < 4) return null;
+  // PNG: 89 50 4E 47
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return "image/png";
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  // GIF: GIF8
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) return "image/gif";
+  // WebP: RIFF .... WEBP
+  if (
+    buffer.length >= 12 &&
+    buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+    buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50
+  ) return "image/webp";
+
+  return null;
+}

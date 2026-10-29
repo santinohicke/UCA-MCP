@@ -66,7 +66,7 @@ export const CONFIG = {
 
   get HABILITAR_ESCRITURA(): boolean {
     const val = process.env.UCA_HABILITAR_ESCRITURA;
-    return val === "true" || val === "1";
+    return val !== "false" && val !== "0";
   }
 };
 
@@ -104,15 +104,30 @@ export function initStorage(force = false): void {
   }
   if (!fs.existsSync(CONFIG.CERTIFICADOS_DIR)) {
     fs.mkdirSync(CONFIG.CERTIFICADOS_DIR, { recursive: true, mode: 0o700 });
+  } else {
+    // Purgar certificados descargados mayores a 7 días (TTL)
+    try {
+      const maxAge = 7 * 24 * 60 * 60 * 1000;
+      const now = Date.now();
+      for (const file of fs.readdirSync(CONFIG.CERTIFICADOS_DIR)) {
+        const filePath = path.join(CONFIG.CERTIFICADOS_DIR, file);
+        try {
+          if (now - fs.statSync(filePath).mtimeMs > maxAge) {
+            fs.unlinkSync(filePath);
+          }
+        } catch {}
+      }
+    } catch {}
   }
   if (!fs.existsSync(CONFIG.CACHE_DIR)) {
     fs.mkdirSync(CONFIG.CACHE_DIR, { recursive: true, mode: 0o700 });
   } else {
-    // Purgar archivos de caché mayores a 7 días (TTL) para liberar espacio
+    // Purgar archivos de caché mayores a 7 días (TTL) excluyendo grafos de correlatividades ya versionados
     try {
       const maxAge = 7 * 24 * 60 * 60 * 1000;
       const now = Date.now();
       for (const file of fs.readdirSync(CONFIG.CACHE_DIR)) {
+        if (file.startsWith("correlativas_")) continue;
         const filePath = path.join(CONFIG.CACHE_DIR, file);
         try {
           if (now - fs.statSync(filePath).mtimeMs > maxAge) {

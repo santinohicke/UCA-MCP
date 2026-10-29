@@ -25,6 +25,7 @@ export interface SessionData {
   userName?: string;
   carreraActiva?: string;
   carrerasDisponibles?: Array<{ id: string; nombre: string }>;
+  evaMaterias?: Array<{ id: number; nombre: string; codigo?: string; url: string }>;
   savedAt: string;
 }
 
@@ -153,11 +154,16 @@ export function saveEncryptedSession(data: SessionData, shouldAudit = false): vo
 
   const sessionLockPath = `${CONFIG.ENCRYPTED_SESSION_PATH}.lock`;
   let acquired = false;
-  // Intento no bloqueante de adquisición del lock para evitar busy-spin al 100% de CPU en el main thread
+  // Intento de adquisición del lock con breve pausa para serializar concurrencia sin saturar CPU
   for (let attempt = 0; attempt < 5; attempt++) {
     if (acquireLock(sessionLockPath)) {
       acquired = true;
       break;
+    }
+    if (attempt < 4) {
+      try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+      } catch {}
     }
   }
 
@@ -248,6 +254,11 @@ export function loadEncryptedSession(): SessionData | null {
   }
 }
 
+const sessionPurgeHooks: Array<() => void> = [];
+export function registerSessionPurgeHook(hook: () => void): void {
+  sessionPurgeHooks.push(hook);
+}
+
 // Purga local completa de sesión
 export function clearSession(): void {
   if (cookieSaveTimeout) {
@@ -261,5 +272,22 @@ export function clearSession(): void {
   cachedSession = null;
   lastMtime = 0;
   clearCachedMasterKey();
+
+  // Invalidar cachés en memoria de plataformas y purgar CACHE_DIR
+  for (const hook of sessionPurgeHooks) {
+    try {
+      hook();
+    } catch {}
+  }
+  if (fs.existsSync(CONFIG.CACHE_DIR)) {
+    try {
+      for (const file of fs.readdirSync(CONFIG.CACHE_DIR)) {
+        try {
+          fs.unlinkSync(path.join(CONFIG.CACHE_DIR, file));
+        } catch {}
+      }
+    } catch {}
+  }
+
   logger.audit("session_cleared", {});
 }

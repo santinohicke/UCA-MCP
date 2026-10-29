@@ -429,6 +429,7 @@ export function startBackgroundLogin(forzarRelogin = false): boolean {
     if (fs.existsSync(CONFIG.CERTIFICADOS_DIR)) {
       try {
         fs.rmSync(CONFIG.CERTIFICADOS_DIR, { recursive: true, force: true });
+        fs.mkdirSync(CONFIG.CERTIFICADOS_DIR, { recursive: true, mode: 0o700 });
       } catch {}
     }
   }
@@ -710,6 +711,11 @@ async function executeInteractiveLogin(): Promise<void> {
         iniciadoEn: loginStatus.iniciadoEn,
         finalizadoEn: new Date().toISOString()
       };
+      setTimeout(() => {
+        import("../guarani/client.js")
+          .then(({ prefetchPlanGraph }) => prefetchPlanGraph().catch(() => {}))
+          .catch(() => {});
+      }, 500);
     } else if (windowClosed) {
       loginStatus = {
         estado: "cancelado",

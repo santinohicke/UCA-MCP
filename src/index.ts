@@ -42,6 +42,31 @@ async function main() {
   });
 
   await server.connect(transport);
+
+  // Pre-calentamiento proactivo en background si ya hay sesión guardada
+  setTimeout(() => {
+    import("./auth/session.js").then(({ loadEncryptedSession }) => {
+      const session = loadEncryptedSession();
+      if (session?.moodleSession) {
+        import("./eva/client.js").then(({ getMaterias }) => {
+          getMaterias(false).catch(() => {});
+        }).catch(() => {});
+      }
+      if (session?.siuSession) {
+        import("./guarani/client.js").then(({ ensureCarreraActiva, prefetchPlanGraph }) => {
+          ensureCarreraActiva().then(() => prefetchPlanGraph()).catch(() => {});
+        }).catch(() => {});
+      }
+    }).catch(() => {});
+  }, 1500);
+
+  // Keepalive periódico cada 15 min para evitar vencimiento por inactividad sin demorar la salida del proceso
+  const keepAliveTimer = setInterval(() => {
+    import("./shared/http.js").then(({ pingKeepAlive }) => {
+      pingKeepAlive().catch(() => {});
+    }).catch(() => {});
+  }, 15 * 60 * 1000);
+  keepAliveTimer.unref();
 }
 
 main().catch(async (err) => {

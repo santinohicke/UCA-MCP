@@ -21,6 +21,11 @@ export interface TramiteInfo {
 export interface CampusInfo {
   aranceles: CuotaInfo[];
   tramites: TramiteInfo[];
+  estadoAranceles?: string;
+  errores?: {
+    aranceles?: string;
+    tramites?: string;
+  };
 }
 
 // Mapea el texto de estado a los valores tipados de CuotaInfo sin falsos positivos en impago/no pagado
@@ -164,10 +169,18 @@ export async function getArancelesYTramites(
           estado: "Al día"
         });
       }
+      result.estadoAranceles = result.aranceles.some((a) => a.estado === "Pendiente" || a.estado === "Vencido")
+        ? "Con deuda pendiente"
+        : "Al día";
     } catch (err) {
       logger.error(`No se pudieron obtener aranceles en Campus Autogestión: ${err}`);
       arancelesError = err;
       if (consulta === "aranceles") throw err;
+      result.estadoAranceles = "Error al consultar aranceles";
+      result.errores = {
+        ...result.errores,
+        aranceles: err instanceof Error ? err.message : String(err)
+      };
     }
   }
 
@@ -242,6 +255,10 @@ export async function getArancelesYTramites(
       logger.error(`No se pudieron obtener trámites en Campus Autogestión: ${err}`);
       tramitesError = err;
       if (consulta === "tramites") throw err;
+      result.errores = {
+        ...result.errores,
+        tramites: err instanceof Error ? err.message : String(err)
+      };
     }
   }
 

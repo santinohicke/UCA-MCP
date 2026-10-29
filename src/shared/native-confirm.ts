@@ -45,20 +45,20 @@ export function unwrapUntrustedContent(text: string): string {
   return match ? match[1] : text;
 }
 
-// Sanitiza cadenas para impedir distorsiones o inyecciones visuales en el diálogo nativo (limpia zero-width y bidi isolates)
+// Sanitiza cadenas para impedir distorsiones o inyecciones visuales en el diálogo nativo (limpia zero-width, bidi, soft-hyphen, tags Unicode y hangul filler)
 export function sanitizeDialogText(text: string, maxLen = 1000, preserveNewlines = false): string {
   if (preserveNewlines) {
     return text
       .replace(/\r\n|\r/g, "\n")
       .replace(/[^\S\n]+/g, " ")
-      .replace(/[\x00-\x09\x0B-\x1F\x7F-\x9F\u061C\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "")
+      .replace(/[\x00-\x09\x0B-\x1F\x7F-\x9F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u3164\uFEFF\u{E0000}-\u{E007F}]/gu, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim()
       .slice(0, maxLen);
   }
   return text
     .replace(/\r\n|\r|\n|\t/g, " ")
-    .replace(/[\x00-\x1F\x7F-\x9F\u061C\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "")
+    .replace(/[\x00-\x1F\x7F-\x9F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u3164\uFEFF\u{E0000}-\u{E007F}]/gu, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, maxLen);

@@ -1,5 +1,19 @@
+import fs from "node:fs";
+import path from "node:path";
+import { CONFIG } from "../config.js";
 import { getTareasYNotas, getForos, type TareaInfo, type ForoItem } from "../eva/client.js";
 import { getEstadoCursada, type CursadaInfo } from "../guarani/client.js";
+
+export interface ResumenSnapshotData {
+  timestamp: number;
+  knownTaskIds: number[];
+  knownForumPostIds: number[];
+}
+
+export interface ResumenNovedades {
+  nuevasTareas: Array<{ id: number; nombre: string; materia?: string }>;
+  nuevosAvisos: Array<{ id: number; asunto: string; autor?: string }>;
+}
 
 export interface ResumenSemanalInfo {
   fechaGeneracion: string;
@@ -7,6 +21,7 @@ export interface ResumenSemanalInfo {
   avisosRecientes: ForoItem[];
   estadoCursada: CursadaInfo[];
   alertas: string[];
+  novedades?: ResumenNovedades;
 }
 
 // Genera un resumen semanal consolidado consultando EVA y SIU Guaraní en paralelo
@@ -39,15 +54,60 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
 
   alertas.push(...generarAlertasTareas(tareasProximas));
 
-  return {
-    fechaGeneracion: new Date().toLocaleString("es-AR", {
-      timeZone: "America/Argentina/Buenos_Aires"
-    }),
-    tareasProximas,
-    avisosRecientes,
-    estadoCursada,
-    alertas
-  };
+  // Detección de novedades comparando con snapshot anterior
+  let novedades: ResumenNovedades | undefined;
+  const snapshotPath = path.join(CONFIG.CACHE_DIR, "resumen_snapshot.json");
+  try {
+    if (fs.existsSync(snapshotPath)) {
+      const prev: ResumenSnapshotData = JSON.parse(fs.readFileSync(snapshotPath, "utf-8"));
+      const prevTasks = new Set(prev.knownTaskIds || []);
+      const prevForums = new Set(prev.knownForumPostIds || []);
+
+      const nuevasTareas = tareasProximas
+        .filter((t) => !prevTasks.has(t.id))
+        .map((t) => ({ id: t.id, nombre: t.nombre, materia: t.materiaNombre }));
+      const nuevosAvisos = avisosRecientes
+        .filter((a) => !prevForums.has(a.id))
+        .map((a) => ({ id: a.id, asunto: a.asunto, autor: a.autor }));
+
+      if (nuevasTareas.length > 0 || nuevosAvisos.length > 0) {
+        novedades = { nuevasTareas, nuevosAvisos };
+        if (nuevasTareas.length > 0) {
+          alertas.push(`🔔 ${nuevasTareas.length} tarea(s) nueva(s) detectada(s) desde el último resumen.`);
+        }
+        if (nuevosAvisos.length > 0) {
+          alertas.push(`🔔 ${nuevosAvisos.length} aviso(s) nuevo(s) detectado(s) en foros desde el último resumen.`);
+        }
+      }
+    }
+  } catch {}
+
+  // Guardar snapshot actualizado
+  try {
+    const currentSnapshot: ResumenSnapshotData = {
+      timestamp: Math.floor(Date.now() / 1000),
+      knownTaskIds: tareasProximas.map((t) => t.id),
+      knownForumPostIds: avisosRecientes.map((a) => a.id)
+    };
+    fs.writeFileSync(snapshotPath, JSON.stringify(currentSnapshot, null, 2), "utf-8");
+  } catch {}
+
+  // Resumen compacto para optimizar tokens y latencia del LLM (omite texto extenso de tareas e historial detallado de inasistencias)
+  const compactTareas = tareasProximas.map(({ descripcion, ...t }) => t);
+  const compactCursada = estadoCursada.map(({ detalleInasistencias, ...c }) => c);
+
+  return JSON.parse(
+    JSON.stringify({
+      fechaGeneracion: new Date().toLocaleString("es-AR", {
+        timeZone: "America/Argentina/Buenos_Aires"
+      }),
+      tareasProximas: compactTareas,
+      avisosRecientes,
+      estadoCursada: compactCursada,
+      alertas,
+      novedades
+    })
+  );
 }
 
 // Genera alertas semánticas para tareas pendientes y vencidas

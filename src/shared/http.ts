@@ -42,50 +42,90 @@ class AsyncMutex {
     this.queue = next.catch(() => {});
     return next;
   }
+
+  isInsideLock(): boolean {
+    return Boolean(this.storage.getStore());
+  }
 }
 
 export const guaraniMutex = new AsyncMutex();
 
 const UCA_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
-// Semáforo para limitar la concurrencia global de solicitudes a las plataformas UCA (máx 4 simultáneas)
+// Semáforo con priorización para evitar que tareas de background bloqueen consultas interactivas (máx 4 simultáneas)
 class Semaphore {
   private active = 0;
-  private queue: (() => void)[] = [];
+  private highQueue: (() => void)[] = [];
+  private lowQueue: (() => void)[] = [];
 
   constructor(private max: number) {}
 
-  async acquire(): Promise<() => void> {
+  async acquire(priority: "high" | "low" = "high"): Promise<() => void> {
     if (this.active < this.max) {
       this.active++;
       return () => this.release();
     }
     return new Promise((resolve) => {
-      this.queue.push(() => {
+      const task = () => {
         this.active++;
         resolve(() => this.release());
-      });
+      };
+      if (priority === "high") {
+        this.highQueue.push(task);
+      } else {
+        this.lowQueue.push(task);
+      }
     });
   }
 
   private release(): void {
     this.active--;
-    const next = this.queue.shift();
+    const next = this.highQueue.shift() || this.lowQueue.shift();
     if (next) next();
   }
 }
 
 const httpLimiter = new Semaphore(4);
 
-// Despacha peticiones con limitación de concurrencia y backoff exponencial ante 429/503 (solo métodos idempotentes GET/HEAD)
-async function fetchWithRetry(url: string, init: RequestInit, maxRetries = 2): Promise<Response> {
-  const release = await httpLimiter.acquire();
+export type FetchPriority = "high" | "low" | "auto";
+
+// Despacha peticiones con limitación de concurrencia y backoff exponencial ante 429/502/503/504 o fallas transitorias de red (solo métodos idempotentes GET/HEAD)
+async function fetchWithRetry(url: string, init: RequestInit & { priority?: FetchPriority } = {}, maxRetries = 2): Promise<Response> {
+  const priority = init.priority === "low" ? "low" : "high";
+  const release = await httpLimiter.acquire(priority);
+  // Crear el signal DESPUÉS de acquire() para que el timeout no incluya la espera en cola
+  const timeoutSignal = init.signal ?? AbortSignal.timeout(20000);
+  const startTime = Date.now();
+  const method = (init.method || "GET").toUpperCase();
   try {
-    const method = (init.method || "GET").toUpperCase();
     const isIdempotent = method === "GET" || method === "HEAD";
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      const res = await fetch(url, init);
-      if (isIdempotent && (res.status === 429 || res.status === 503) && attempt < maxRetries) {
+      let res: Response;
+      try {
+        res = await fetch(url, { ...init, signal: timeoutSignal });
+      } catch (networkErr: any) {
+        if (process.env.UCA_DEBUG_TIMING === "1") {
+          const parsed = new URL(url);
+          logger.info(`[TIMING] ${method} ${parsed.hostname}${parsed.pathname} -> ERROR (${Date.now() - startTime}ms)`);
+        }
+        const isTransient =
+          networkErr?.code === "ECONNRESET" ||
+          networkErr?.cause?.code === "ECONNRESET" ||
+          networkErr?.code === "ETIMEDOUT" ||
+          networkErr?.cause?.code === "ETIMEDOUT";
+        if (isIdempotent && isTransient && attempt < maxRetries) {
+          const delayMs = (attempt + 1) * 1500;
+          logger.warn(`Error de red transitorio (${networkErr?.code || "desconexión"}). Reintentando en ${delayMs}ms...`);
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        throw networkErr;
+      }
+      if (process.env.UCA_DEBUG_TIMING === "1") {
+        const parsed = new URL(url);
+        logger.info(`[TIMING] ${method} ${parsed.hostname}${parsed.pathname} -> ${res.status} (${Date.now() - startTime}ms)`);
+      }
+      if (isIdempotent && [429, 502, 503, 504].includes(res.status) && attempt < maxRetries) {
         const retryAfterSec = parseInt(res.headers.get("retry-after") || "", 10);
         const delayMs = !isNaN(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : (attempt + 1) * 1500;
         logger.warn(`HTTP ${res.status} recibido de ${new URL(url).hostname}. Reintentando en ${delayMs}ms...`);
@@ -145,8 +185,7 @@ async function rawEvaFetch(path: string, options: RequestInit = {}): Promise<Res
       method: currentMethod,
       body: currentBody,
       redirect: "manual",
-      headers,
-      signal: options.signal || AbortSignal.timeout(20000)
+      headers
     });
 
     // Actualizar cookies recibidas en Set-Cookie
@@ -308,8 +347,99 @@ export async function evaAjaxRpc<T = unknown>(
   return first.data as T;
 }
 
+export interface EvaBatchCall {
+  methodname: string;
+  args?: Record<string, unknown>;
+}
+
+export interface EvaBatchResult<T = unknown> {
+  data?: T;
+  error?: boolean;
+  errorcode?: string;
+  exception?: { message?: string; errorcode?: string };
+}
+
+// Invocación a servicios AJAX de Moodle agrupados en un solo POST HTTP (/lib/ajax/service.php)
+export async function evaAjaxBatch<T = unknown>(
+  calls: EvaBatchCall[],
+  allowRefresh = true
+): Promise<Array<{ data?: T; error?: string; errorcode?: string }>> {
+  if (calls.length === 0) return [];
+
+  const session = loadEncryptedSession();
+  if (!session?.moodleSession || !session?.sesskey) {
+    throw new SessionExpiredError();
+  }
+
+  const payload = calls.map((c, index) => ({
+    index,
+    methodname: c.methodname,
+    args: c.args || {}
+  }));
+
+  const url = `${CONFIG.EVA_BASE_URL}/lib/ajax/service.php?sesskey=${session.sesskey}&info=batch`;
+  const response = await evaFetch(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify(payload)
+    },
+    allowRefresh
+  );
+
+  if (!response.ok) {
+    logger.error(`Error HTTP ${response.status} en llamada AJAX batch de Moodle`);
+    throw new Error(`Error en servicio Moodle (batch): HTTP ${response.status}`);
+  }
+
+  const results = (await response.json()) as EvaBatchResult<T>[];
+  if (!Array.isArray(results)) {
+    throw new Error("Respuesta inválida de Moodle para lote AJAX");
+  }
+
+  const sessionErr = results.find(
+    (r) =>
+      r.error &&
+      (r.errorcode === "servicerequireslogin" ||
+        r.errorcode === "invalidsesskey" ||
+        r.errorcode === "sessionerroruser" ||
+        r.exception?.errorcode === "servicerequireslogin" ||
+        r.exception?.errorcode === "invalidsesskey" ||
+        r.exception?.errorcode === "sessionerroruser")
+  );
+
+  if (sessionErr) {
+    if (allowRefresh) {
+      try {
+        const { silentRefreshEva } = await import("../auth/browser-driver.js");
+        const refreshed = await silentRefreshEva();
+        if (refreshed) {
+          return await evaAjaxBatch<T>(calls, false);
+        }
+      } catch {}
+    }
+    throw new SessionExpiredError("Sesión en EVA vencida o inválida. Invocá 'uca_iniciar_sesion'.");
+  }
+
+  return results.map((r, idx) => {
+    if (r.error) {
+      const errorcode = r.errorcode || r.exception?.errorcode;
+      const errorMsg = r.exception?.message || "Error devuelto por Moodle";
+      if (errorcode === "servicenotavailable") {
+        disabledRpcMethods.add(calls[idx].methodname);
+      }
+      return { error: errorMsg, errorcode };
+    }
+    return { data: r.data };
+  });
+}
+
 // Fetch interno para SIU Guaraní 3 con detección de expiración en 200/JSON
-async function rawGuaraniFetch(pathOrUrl: string, options: RequestInit = {}): Promise<Response> {
+async function rawGuaraniFetch(pathOrUrl: string, options: RequestInit & { priority?: FetchPriority } = {}): Promise<Response> {
   const allowedOrigin = new URL(CONFIG.GUARANI_BASE_URL).origin;
   const basePath = new URL(CONFIG.GUARANI_BASE_URL).pathname.replace(/\/$/, "");
   let cleanPath: string;
@@ -362,8 +492,7 @@ async function rawGuaraniFetch(pathOrUrl: string, options: RequestInit = {}): Pr
 
   const response = await fetchWithRetry(targetUrl.href, {
     ...options,
-    headers,
-    signal: options.signal || AbortSignal.timeout(20000)
+    headers
   });
 
   // Actualizar cookies recibidas
@@ -391,7 +520,10 @@ async function rawGuaraniFetch(pathOrUrl: string, options: RequestInit = {}): Pr
     contentType.includes("application/zip") ||
     contentType.startsWith("image/");
 
-  if (!isBinary) {
+  const contentLength = parseInt(response.headers.get("content-length") || "0", 10);
+  const isTooLargeForAuthCheck = contentLength > 256 * 1024;
+
+  if (!isBinary && !isTooLargeForAuthCheck) {
     const clone = response.clone();
     try {
       const text = await clone.text();
@@ -417,7 +549,7 @@ async function rawGuaraniFetch(pathOrUrl: string, options: RequestInit = {}): Pr
 // Fetch autenticado para SIU Guaraní 3 con intento automático de refresh silencioso
 export async function guaraniFetch(
   path: string,
-  options: RequestInit = {},
+  options: RequestInit & { priority?: FetchPriority } = {},
   allowRefresh = true
 ): Promise<Response> {
   try {
@@ -474,8 +606,7 @@ async function rawCampusFetch(path: string, options: RequestInit = {}): Promise<
 
   const response = await fetchWithRetry(targetUrl.href, {
     ...options,
-    headers,
-    signal: options.signal || AbortSignal.timeout(20000)
+    headers
   });
 
   // Actualizar cookies recibidas
@@ -495,20 +626,32 @@ async function rawCampusFetch(path: string, options: RequestInit = {}): Promise<
   }
 
   // Detectar login en HTTP 200 de Campus Autogestión (portal Next.js) para disparar silent refresh
-  const clone = response.clone();
-  try {
-    const text = await clone.text();
-    if (
-      text.includes("Acceso al Campus") &&
-      (text.includes("¡Te damos la bienvenida!") ||
-        text.includes("!Te damos la bienvenida!") ||
-        text.includes("Ingresá con tu cuenta") ||
-        text.includes("Ingresa con tu cuenta"))
-    ) {
-      throw new CampusSessionExpiredError();
+  const campusContentType = response.headers.get("content-type") || "";
+  const isCampusBinary =
+    campusContentType.includes("application/pdf") ||
+    campusContentType.includes("application/octet-stream") ||
+    campusContentType.includes("application/zip") ||
+    campusContentType.startsWith("image/");
+
+  const campusContentLength = parseInt(response.headers.get("content-length") || "0", 10);
+  const isCampusTooLarge = campusContentLength > 256 * 1024;
+
+  if (!isCampusBinary && !isCampusTooLarge) {
+    const clone = response.clone();
+    try {
+      const text = await clone.text();
+      if (
+        text.includes("Acceso al Campus") &&
+        (text.includes("¡Te damos la bienvenida!") ||
+          text.includes("!Te damos la bienvenida!") ||
+          text.includes("Ingresá con tu cuenta") ||
+          text.includes("Ingresa con tu cuenta"))
+      ) {
+        throw new CampusSessionExpiredError();
+      }
+    } catch (e) {
+      if (e instanceof CampusSessionExpiredError) throw e;
     }
-  } catch (e) {
-    if (e instanceof CampusSessionExpiredError) throw e;
   }
 
   return response;
@@ -536,5 +679,26 @@ export async function campusFetch(
       }
     }
     throw err;
+  }
+}
+
+// Ping liviano para mantener vivas las sesiones activas contra timeout de inactividad
+export async function pingKeepAlive(): Promise<void> {
+  const session = loadEncryptedSession();
+  if (!session) return;
+  if (session.moodleSession) {
+    try {
+      await rawEvaFetch("/my/", { signal: AbortSignal.timeout(10000) });
+    } catch {}
+  }
+  if (session.siuSession) {
+    try {
+      await rawGuaraniFetch("/inicio_alumno", { signal: AbortSignal.timeout(10000) });
+    } catch {}
+  }
+  if (session.campusSession || session.campusToken) {
+    try {
+      await rawCampusFetch("/", { signal: AbortSignal.timeout(10000) });
+    } catch {}
   }
 }

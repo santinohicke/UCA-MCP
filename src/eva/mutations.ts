@@ -3,7 +3,8 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import * as cheerio from "cheerio";
 import { evaFetch, evaAjaxRpc } from "../shared/http.js";
-import { showNativeConfirmation, validateUploadFile, pickNativeFile } from "../shared/native-confirm.js";
+import { showNativeConfirmation, validateUploadFile, pickNativeFile, sanitizeDialogText } from "../shared/native-confirm.js";
+import { clearEvaCache } from "./client.js";
 import { logger } from "../shared/logger.js";
 
 // Escapa entidades HTML críticas para prevenir inyección de etiquetas arbitrarias en Moodle
@@ -176,6 +177,18 @@ export async function guardarBorradorTarea(
     );
   }
 
+  // Rechazar si el texto contiene caracteres invisibles o de control que el diálogo eliminaría (what-you-see ≠ what-you-send)
+  let textoClean: string | undefined;
+  if (textoEnLinea) {
+    const textoNormalized = textoEnLinea.replace(/\r\n|\r/g, "\n");
+    textoClean = sanitizeDialogText(textoNormalized, 350, true);
+    if (textoClean !== textoNormalized) {
+      throw new Error(
+        "El texto en línea contiene caracteres invisibles o de control no permitidos."
+      );
+    }
+  }
+
   // Verificar si la tarea permite entregas / edición
   const puedeEditar = viewHtml.includes("action=editsubmission") || viewHtml.includes("action=editprevioussubmission");
   const noAceptaEntregas =
@@ -267,7 +280,7 @@ export async function guardarBorradorTarea(
     advertencia += "\n⚠️ AVISO: No se pudo verificar si la tarea exige confirmación de entrega o si el guardado constituye entrega definitiva. Verificá tu entrega en EVA tras guardar.\n";
   }
 
-  const detalleDialogo = `Tarea: ${nombreTarea}\nCurso: ${nombreCurso}\n${fechaVencimiento ? `Vencimiento: ${fechaVencimiento}\n` : ""}${fileDetails}\nTexto: ${textoEnLinea ? `"${textoEnLinea}"` : "Sin texto en línea"}${advertencia}`;
+  const detalleDialogo = `Tarea: ${nombreTarea}\nCurso: ${nombreCurso}\n${fechaVencimiento ? `Vencimiento: ${fechaVencimiento}\n` : ""}${fileDetails}\nTexto: ${textoClean ? `"${textoClean}"` : "Sin texto en línea"}${advertencia}`;
 
   if (detalleDialogo.length > 800) {
     throw new Error(
@@ -375,7 +388,7 @@ export async function guardarBorradorTarea(
     }
 
     // Serializar inputs del formulario de Moodle mediante helper puro compartido
-    const postBody = buildSaveSubmissionFormData(formHtml, cmid, sesskey, draftItemMatch, textoEnLinea);
+    const postBody = buildSaveSubmissionFormData(formHtml, cmid, sesskey, draftItemMatch, textoClean || textoEnLinea);
 
     const saveRes = await evaFetch(`/mod/assign/view.php?id=${cmid}`, {
       method: "POST",
@@ -467,6 +480,8 @@ export async function guardarBorradorTarea(
       entregaDefinitiva: esEntregaDefinitiva
     });
 
+    clearEvaCache();
+
     return {
       exito: true,
       mensaje: esEntregaDefinitiva
@@ -502,6 +517,13 @@ export async function responderForo(
     );
   }
 
+  // Rechazar si el mensaje contiene caracteres invisibles o de control que el diálogo eliminaría (what-you-see ≠ what-you-send)
+  const msgNormalized = msgTrimmed.replace(/\r\n|\r/g, "\n");
+  const msgClean = sanitizeDialogText(msgNormalized, 350, true);
+  if (msgClean !== msgNormalized) {
+    throw new Error("El mensaje contiene caracteres invisibles o de control no permitidos.");
+  }
+
   await onProgress?.("Identificando hilo de discusión en EVA Moodle...");
   // Obtener la discusión para extraer el postid del mensaje principal, el asunto y nombres legibles
   const discRes = await evaFetch(`/mod/forum/discuss.php?d=${discusionId}`);
@@ -517,7 +539,7 @@ export async function responderForo(
   const { parentPostId, replySubject, nombreForo, autorOriginal } = forumCtx;
   const baseSubject = replySubject.startsWith("Re: ") ? replySubject.slice(4) : replySubject;
 
-  const detalleDialogo = `Foro: ${nombreForo}\nDocente/Autor original: ${autorOriginal}\nAsunto: ${replySubject}\n\nMensaje a publicar:\n"${msgTrimmed}"\n\nEste mensaje será visible por todos los alumnos y docentes del curso.`;
+  const detalleDialogo = `Foro: ${nombreForo}\nDocente/Autor original: ${autorOriginal}\nAsunto: ${replySubject}\n\nMensaje a publicar:\n"${msgClean}"\n\nEste mensaje será visible por todos los alumnos y docentes del curso.`;
 
   if (detalleDialogo.length > 800) {
     throw new Error(
@@ -547,8 +569,7 @@ export async function responderForo(
   }
 
   try {
-    const formattedMsg = msgTrimmed
-      .replace(/\r\n|\r/g, "\n")
+    const formattedMsg = msgClean
       .split("\n")
       .map((l) => `<p>${escapeHtml(l)}</p>`)
       .join("");

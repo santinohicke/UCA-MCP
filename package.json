@@ -1,6 +1,6 @@
 {
   "name": "uca-mcp",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Model Context Protocol (MCP) server para la Universidad Católica Argentina (UCA) - Proyecto No Oficial",
   "type": "module",
   "main": "build/src/index.js",
@@ -36,6 +36,7 @@
     "login": "node build/bin/cli.js login",
     "status": "node build/bin/cli.js status",
     "logout": "node build/bin/cli.js logout",
+    "test": "node --test test/**/*.test.mjs",
     "pack:mcpb": "node scripts/vendor-pdfjs.mjs && tsc && node scripts/pack-mcpb.mjs"
   },
   "dependencies": {
