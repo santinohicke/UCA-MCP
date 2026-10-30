@@ -19,114 +19,137 @@ Servidor **Model Context Protocol (MCP)** open source para conectar a tus asiste
 
 ---
 
-## Inicio Rápido
+## Instalación
 
-### Opción 1: Instalación Sin Terminal con `.mcpb` (Recomendada para Claude Desktop)
+> **Prerequisito:** Necesitás [Node.js](https://nodejs.org) **v20.18.1 o superior** instalado en tu computadora (salvo la opción `.mcpb` de Claude Desktop que no lo requiere).
 
-1. Descargá el paquete preempaquetado [`uca-mcp-1.0.7.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde los Releases.
-2. Entra a **Configuración -> Extensiones** y arrastrá el archivo `.mcpb`. Claude Desktop te dejará instalarlo sin requerir consola ni comandos.
-3. Abrí un nuevo chat en Claude y escribí:  
-   > *"Iniciá sesión en UCA"*
-4. Claude abrirá una ventana de navegador para que completes tus credenciales `@uca.edu.ar` y el 2FA. ¡Listo!
+Elegí tu cliente y seguí los pasos. El `uca-mcp login` abre el navegador para que te loguees con tu cuenta `@uca.edu.ar` y el 2FA — hacelo una sola vez.
 
 ---
 
-### Opción 2: Instalación vía Terminal (NPM / CLI)
+### Claude Desktop
 
-Si preferís usar la terminal o tu cliente requiere configuración por comando, lo más rápido es instalarlo con npm una sola vez para que responda al instante:
+**Opción A — Sin terminal (recomendada):**
 
-1. **Instalar globalmente:**
-   ```bash
-   npm install -g uca-mcp
-   ```
+1. Descargá [`uca-mcp-1.0.7.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
+2. En Claude Desktop andá a **Configuración → Extensiones** y arrastrá el archivo `.mcpb`.
+3. Abrí un nuevo chat y escribí *"Iniciá sesión en UCA"*. Listo.
 
-2. **Iniciar Sesión Institucional:**
-   ```bash
-   uca-mcp login
-   ```
-   Se abrirá una ventana de tu navegador (Edge, Chrome). Ingresá con tu cuenta `@uca.edu.ar`, aprobá el doble factor (2FA/MFA) en tu celular y marcá **"Mantener la sesión iniciada"**.
-   
-3. **Verificar Estado del Entorno:**
-   ```bash
-   uca-mcp doctor
-   ```
-   Comprueba versión de Node.js, modo de llavero (Windows / macOS / Linux), navegador detectado, herramienta de diálogo nativo y conectividad directa a EVA, SIU Guaraní y Campus.
-
-*(Asegurate de tener Node.js instalado en tu computadora antes de correr npm).*
-
----
-
-## Configuración por Cliente
-
-### 1. Claude Desktop (Configuración Manual JSON)
-
-```json
-{
-  "mcpServers": {
-    "uca": {
-      "command": "uca-mcp",
-      "args": ["serve"]
-    }
-  }
-}
-```
-*(En Windows, si Claude no detecta el comando global, podés ejecutar `uca-mcp setup claude` para que lo vincule automáticamente con la ruta directa de Node)*.
-
-### 2. Claude Code (CLI)
+**Opción B — Desde terminal:**
 
 ```bash
+npm install -g uca-mcp
+uca-mcp login
+uca-mcp setup claude
+```
+
+Reiniciá Claude Desktop y ya está conectado.
+
+---
+
+### Claude Code / Claude Code CLI
+
+```bash
+npm install -g uca-mcp
+uca-mcp login
 claude mcp add uca -- uca-mcp serve
 ```
 
-### 3. Gemini CLI
+---
+
+### Antigravity / Antigravity CLI
 
 ```bash
-gemini mcp add uca uca-mcp serve
+npm install -g uca-mcp
+uca-mcp login
+agy mcp add uca -- uca-mcp serve
 ```
 
-### 4. Cursor (`~/.cursor/mcp.json` o en tu proyecto `.cursor/mcp.json`)
+---
 
-```json
-{
-  "mcpServers": {
-    "uca": {
-      "command": "uca-mcp",
-      "args": ["serve"]
-    }
-  }
-}
-```
-*(O ejecutá `uca-mcp setup cursor` para configurarlo de forma automática)*.
-
-### 5. VS Code (`.vscode/mcp.json`)
-
-```json
-{
-  "servers": {
-    "uca": {
-      "type": "stdio",
-      "command": "uca-mcp",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-### 6. OpenAI Codex / Asistentes CLI compatibles con MCP
+### Codex / Codex CLI
 
 ```bash
+npm install -g uca-mcp
+uca-mcp login
 codex mcp add uca -- uca-mcp serve
 ```
 
-### 7. Asistente Automático CLI
+---
 
-Podés ejecutar el asistente interactivo para que configure automáticamente los archivos de tu cliente:
+### Cursor
 
 ```bash
-uca-mcp setup claude
+npm install -g uca-mcp
+uca-mcp login
 uca-mcp setup cursor
+```
+
+Reiniciá Cursor y ya está conectado.
+
+---
+
+### VS Code
+
+```bash
+npm install -g uca-mcp
+uca-mcp login
 uca-mcp setup vscode
 ```
+
+Reiniciá VS Code y ya está conectado.
+
+---
+
+### Hermes
+
+```bash
+npm install -g uca-mcp
+uca-mcp login
+hermes mcp add uca -- uca-mcp serve
+```
+
+---
+
+### OpenClaw
+
+```bash
+npm install -g uca-mcp
+uca-mcp login
+openclaw mcp add uca --command "uca-mcp" --arg "serve"
+```
+
+---
+
+### OpenCode
+
+```bash
+npm install -g uca-mcp
+uca-mcp login
+opencode mcp add uca -- uca-mcp serve
+```
+
+---
+
+### Pi
+
+```bash
+npm install -g uca-mcp
+uca-mcp login
+pi mcp add uca -- uca-mcp serve
+```
+
+---
+
+### Verificar que todo funcione (opcional)
+
+Desde cualquier terminal, después de instalar y loguearte:
+
+```bash
+uca-mcp doctor
+```
+
+Comprueba Node.js, llavero del sistema, navegador, diálogo nativo y conectividad a EVA, SIU Guaraní y Campus.
 
 > [!NOTE]
 > **Transporte Exclusivo STDIO Local:** En esta versión (v1), **no cuenta con transporte HTTP/SSE remoto**, por lo que **no es compatible directamente con ChatGPT Web ni aplicaciones móviles** sin un túnel MCP local autogestionado.
