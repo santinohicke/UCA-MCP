@@ -67,7 +67,7 @@ agy mcp add uca -- uca-mcp serve
 
 ---
 
-### Codex / Codex CLI
+### ChatGPT Desktop / Codex CLI
 
 ```bash
 npm install -g uca-mcp
