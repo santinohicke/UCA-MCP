@@ -93,16 +93,16 @@ export type FetchPriority = "high" | "low" | "auto";
 async function fetchWithRetry(url: string, init: RequestInit & { priority?: FetchPriority } = {}, maxRetries = 2): Promise<Response> {
   const priority = init.priority === "low" ? "low" : "high";
   const release = await httpLimiter.acquire(priority);
-  // Crear el signal DESPUÉS de acquire() para que el timeout no incluya la espera en cola
-  const timeoutSignal = init.signal ?? AbortSignal.timeout(20000);
   const startTime = Date.now();
   const method = (init.method || "GET").toUpperCase();
   try {
     const isIdempotent = method === "GET" || method === "HEAD";
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       let res: Response;
+      // Signal por intento para que un reintento no herede un timeout ya expirado o consumido
+      const attemptSignal = init.signal ?? AbortSignal.timeout(20000);
       try {
-        res = await fetch(url, { ...init, signal: timeoutSignal });
+        res = await fetch(url, { ...init, signal: attemptSignal });
       } catch (networkErr: any) {
         if (process.env.UCA_DEBUG_TIMING === "1") {
           const parsed = new URL(url);

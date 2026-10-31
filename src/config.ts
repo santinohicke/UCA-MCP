@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
 function getBaseDir(): string {
   if (process.env.UCA_MCP_STORAGE_DIR) {
@@ -19,10 +20,14 @@ function getBaseDir(): string {
 
 function getPackageVersion(): string {
   try {
-    const pkgPath = new URL("../../package.json", import.meta.url);
-    if (fs.existsSync(pkgPath)) {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-      if (pkg.version) return pkg.version;
+    let dir = path.dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 5; i++) {
+      const pkgPath = path.join(dir, "package.json");
+      if (fs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+        if (pkg.name === "uca-mcp" && pkg.version) return pkg.version;
+      }
+      dir = path.dirname(dir);
     }
   } catch {}
   return "1.0.7";

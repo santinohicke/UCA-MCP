@@ -1,4 +1,5 @@
-import { evaAjaxRpc, evaAjaxBatch, evaFetch, isRpcMethodAvailable, SessionExpiredError } from "../shared/http.js";
+import { evaAjaxRpc, evaAjaxBatch, evaFetch, SessionExpiredError } from "../shared/http.js";
+import { ttlCached } from "../shared/ttl-cache.js";
 import * as cheerio from "cheerio";
 import { CONFIG } from "../config.js";
 import { registerSessionPurgeHook, loadEncryptedSession, saveEncryptedSession } from "../auth/session.js";
@@ -275,6 +276,64 @@ export async function getMaterias(incluirArchivadas = false, forzarRefresco = fa
   return materias;
 }
 
+const contenidoInflight = new Map<number, Promise<SeccionCurso[]>>();
+
+// Carga las secciones de un curso deduplicando llamadas simultáneas (precarga de arranque + herramienta)
+function cargarSeccionesCurso(cursoId: number, forzarRefresco: boolean): Promise<SeccionCurso[]> {
+  const pending = contenidoInflight.get(cursoId);
+  if (pending && !forzarRefresco) return pending;
+  const p = cargarSeccionesCursoSinCache(cursoId)
+    .then((secciones) => {
+      if (secciones.length > 0) {
+        contenidoCache.set(cursoId, { data: secciones, expires: Date.now() + CACHE_TTL_MS });
+      }
+      return secciones;
+    })
+    .finally(() => {
+      if (contenidoInflight.get(cursoId) === p) contenidoInflight.delete(cursoId);
+    });
+  contenidoInflight.set(cursoId, p);
+  return p;
+}
+
+async function cargarSeccionesCursoSinCache(cursoId: number): Promise<SeccionCurso[]> {
+  // core_courseformat_get_state: JSON de ~20 KB en vez de una página HTML de hasta ~3 MB
+  try {
+    const raw = await evaAjaxRpc<string>("core_courseformat_get_state", { courseid: cursoId });
+    const secciones = parseEstadoCurso(raw);
+    if (secciones.length > 0) return secciones;
+  } catch (err) {
+    if (err instanceof SessionExpiredError) throw err;
+  }
+
+  // Respaldo ante un fallo puntual: scraping de /course/view.php?id={cursoId}
+  const res = await evaFetch(`/course/view.php?id=${cursoId}`);
+  return parseSeccionesCurso(await res.text());
+}
+
+// Convierte la respuesta de core_courseformat_get_state en SeccionCurso[] (ids de sección = número de sección, igual que el scraping)
+export function parseEstadoCurso(raw: unknown): SeccionCurso[] {
+  const estado = (typeof raw === "string" ? JSON.parse(raw) : raw) as {
+    section?: Array<{ id: string | number; number?: number; title?: string; cmlist?: Array<string | number>; visible?: boolean }>;
+    cm?: Array<{ id: string | number; name?: string; module?: string; url?: string; uservisible?: boolean }>;
+  };
+  const cms = new Map((estado?.cm ?? []).map((c) => [String(c.id), c]));
+  const decode = (t: string) => t.replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  return (estado?.section ?? [])
+    .filter((sec) => sec.visible !== false)
+    .map((sec, idx) => ({
+      id: sec.number ?? idx,
+      nombre: decode(sec.title || "") || `Sección ${sec.number ?? idx}`,
+      modulos: (sec.cmlist ?? []).flatMap((cmid) => {
+        const cm = cms.get(String(cmid));
+        if (!cm || cm.uservisible === false || cm.module === "label") return [];
+        const nombre = decode(cm.name || "");
+        if (!nombre) return [];
+        return [{ id: Number(cm.id), nombre, tipo: cm.module || "recurso", url: cm.url || undefined }];
+      })
+    }));
+}
+
 // 2. Obtener contenido y secciones de un curso (con filtros opcionales de tipo y sección)
 export async function getContenidoCurso(
   cursoId: number,
@@ -289,47 +348,7 @@ export async function getContenidoCurso(
     }
   }
 
-  let secciones: SeccionCurso[] = [];
-
-  if (isRpcMethodAvailable("core_course_get_contents")) {
-    try {
-      const data = await evaAjaxRpc<Array<{
-        id: number;
-        name: string;
-        modules?: Array<{
-          id: number;
-          name: string;
-          modname: string;
-          url?: string;
-        }>;
-      }>>("core_course_get_contents", { courseid: cursoId });
-
-      if (Array.isArray(data)) {
-        secciones = data.map((sec) => ({
-          id: sec.id,
-          nombre: sec.name,
-          modulos: (sec.modules || []).map((m) => ({
-            id: m.id,
-            nombre: m.name,
-            tipo: m.modname,
-            url: m.url
-          }))
-        }));
-      }
-    } catch {
-      // Fallback a scraping de /course/view.php?id={cursoId}
-    }
-  }
-
-  if (secciones.length === 0) {
-    const res = await evaFetch(`/course/view.php?id=${cursoId}`);
-    const html = await res.text();
-    secciones = parseSeccionesCurso(html);
-  }
-
-  if (secciones.length > 0) {
-    contenidoCache.set(cursoId, { data: secciones, expires: Date.now() + CACHE_TTL_MS });
-  }
+  const secciones = await cargarSeccionesCurso(cursoId, forzarRefresco);
 
   let result = secciones;
   if (seccionId !== undefined) {
@@ -364,93 +383,43 @@ export async function getTareasYNotas(
 
   const nowUnix = Math.floor(Date.now() / 1000);
   const timesortfrom = incluirCerradas ? 0 : nowUnix - 86400;
+  // Acotar la ventana: sin límite superior Moodle devuelve eventos de años futuros (cientos de KB, >10 s)
+  const timesortto = incluirCerradas ? undefined : nowUnix + 180 * 86400;
   const tareas: TareaInfo[] = [];
 
-  // 1. Fuente primaria: Mapeo oficial de tareas de Moodle (assignid, cmid, duedate, curso)
-  interface RawAssignment {
-    assignId: number;
-    cmid: number;
-    name: string;
-    duedate: number;
-    courseId?: number;
-    courseName?: string;
-    intro?: string;
-  }
+  // Con curso específico la página de calificaciones se pide en paralelo con los eventos
+  const gradePage = cursoId ? evaFetch(`/grade/report/user/index.php?id=${cursoId}`).then((r) => r.text()) : undefined;
+  gradePage?.catch(() => {});
 
-  const assignMap = new Map<number, RawAssignment>();
-  const allAssignments: RawAssignment[] = [];
-
-  try {
-    const assignsData = await evaAjaxRpc<{
-      courses?: Array<{
-        id: number;
-        fullname?: string;
-        assignments?: Array<{ id: number; cmid: number; name: string; duedate: number; intro?: string }>;
-      }>;
-    }>("mod_assign_get_assignments", cursoId ? { courseids: [cursoId] } : {});
-
-    if (assignsData?.courses) {
-      for (const c of assignsData.courses) {
-        for (const a of c.assignments || []) {
-          const item: RawAssignment = {
-            assignId: a.id,
-            cmid: a.cmid,
-            name: a.name,
-            duedate: a.duedate || 0,
-            courseId: c.id,
-            courseName: c.fullname,
-            intro: a.intro
-          };
-          assignMap.set(a.cmid, item);
-          allAssignments.push(item);
-        }
-      }
-    }
-  } catch {
-    // Si mod_assign_get_assignments no está disponible, se continuará con eventos de calendario
-  }
-
-  // 2. Eventos de calendario para enriquecer metadatos o como fallback
-  const calendarEventMap = new Map<number, any>();
-  let fallbackEvents: any[] = [];
-  try {
-    let events: any[] = [];
-    if (cursoId) {
-      const data = await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_course", {
-        courseid: cursoId,
-        timesortfrom
-      });
-      if (data?.events) events = data.events;
-    } else {
-      const data = await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_timesort", {
-        timesortfrom,
-        limitnum: 50
-      });
-      if (data?.events) events = data.events;
-    }
-    for (const e of events) {
-      const cmidMatch = /[?&]id=(\d+)/.exec(e.url || "");
-      const cmid = cmidMatch ? parseInt(cmidMatch[1], 10) : e.id;
-      calendarEventMap.set(cmid, e);
-    }
-    fallbackEvents = events;
-  } catch (err) {
-    if (err instanceof SessionExpiredError) throw err;
-    if (allAssignments.length === 0) {
-      logger.error(`No se pudieron obtener eventos de calendario en EVA: ${err}`);
+  // Fuente única: eventos de calendario (mod_assign_get_assignments y mod_assign_get_submission_status están
+  // deshabilitados en EVA). Se consultan en paralelo con las materias activas.
+  const eventosTask = (async () => {
+    try {
+      const data = cursoId
+        ? await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_course", {
+            courseid: cursoId,
+            timesortfrom,
+            ...(timesortto ? { timesortto } : {})
+          })
+        : await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_timesort", {
+            timesortfrom,
+            ...(timesortto ? { timesortto } : {}),
+            limitnum: 50
+          });
+      return data?.events ?? [];
+    } catch (err) {
+      if (!(err instanceof SessionExpiredError)) logger.error(`No se pudieron obtener eventos de calendario en EVA: ${err}`);
       throw err;
     }
-  }
+  })();
 
-  let activeCourseIds: Set<number> | null = null;
-  if (!cursoId && !incluirCerradas) {
-    try {
-      const activeCourses = await getMaterias(false);
-      activeCourseIds = new Set(activeCourses.map((c) => c.id));
-    } catch {}
-  }
+  let activeCourseIds = null as Set<number> | null;
+  const materiasTask = (!cursoId && !incluirCerradas)
+    ? getMaterias(false).then((activeCourses) => { activeCourseIds = new Set(activeCourses.map((c) => c.id)); }).catch(() => {})
+    : Promise.resolve();
 
-  // Armar lista base de tareas a procesar
+  const [eventos] = await Promise.all([eventosTask, materiasTask]);
+
   const itemsToProcess: Array<{
     id: number;
     cmid: number;
@@ -458,135 +427,55 @@ export async function getTareasYNotas(
     duedate: number;
     courseId?: number;
     courseName?: string;
-    assignId?: number;
     description?: string;
     actionable?: boolean;
+    modulename?: string;
   }> = [];
 
-  if (allAssignments.length > 0) {
-    for (const a of allAssignments) {
-      const isPast = a.duedate > 0 && a.duedate < (nowUnix - 86400);
-      if (!incluirCerradas) {
-        if (isPast) continue;
-        // Si no tiene fecha límite y pertenece a un curso no activo, omitir
-        if (!cursoId && a.duedate === 0 && activeCourseIds && a.courseId && !activeCourseIds.has(a.courseId)) continue;
-      }
-
-      const calEvent = calendarEventMap.get(a.cmid);
-      itemsToProcess.push({
-        // Usar a.cmid como ID canónico y estable para que no fluctúe si el evento de calendario se crea o expira
-        id: a.cmid || calEvent?.id || 0,
-        cmid: a.cmid,
-        name: a.name,
-        duedate: a.duedate,
-        courseId: a.courseId,
-        courseName: a.courseName,
-        assignId: a.assignId,
-        description: calEvent?.description || a.intro,
-        actionable: calEvent?.action?.actionable
-      });
-    }
-
-    // Incluir eventos de calendario que no son tareas de entrega formal (ej. cuestionarios, parciales online, talleres)
-    for (const e of fallbackEvents) {
-      const cmidMatch = /[?&]id=(\d+)/.exec(e.url || "");
-      const cmid = cmidMatch ? parseInt(cmidMatch[1], 10) : e.id;
-      if (!assignMap.has(cmid)) {
-        const evCourseId = e.course?.id || cursoId;
-        if (!incluirCerradas && activeCourseIds && evCourseId && !activeCourseIds.has(evCourseId)) {
-          continue;
-        }
-        itemsToProcess.push({
-          id: e.id,
-          cmid,
-          name: e.activityname || e.name,
-          duedate: e.timesort || 0,
-          courseId: evCourseId,
-          courseName: e.course?.fullname,
-          assignId: undefined,
-          description: e.description,
-          actionable: e.action?.actionable
-        });
-      }
-    }
-  } else {
-    for (const e of fallbackEvents) {
-      const cmidMatch = /[?&]id=(\d+)/.exec(e.url || "");
-      const cmid = cmidMatch ? parseInt(cmidMatch[1], 10) : e.id;
-      itemsToProcess.push({
-        id: cmid || e.id,
-        cmid,
-        name: e.activityname || e.name,
-        duedate: e.timesort,
-        courseId: e.course?.id || cursoId,
-        courseName: e.course?.fullname,
-        assignId: assignMap.get(cmid)?.assignId,
-        description: e.description,
-        actionable: e.action?.actionable
-      });
-    }
+  for (const e of eventos) {
+    const cmidMatch = /[?&]id=(\d+)/.exec(e.url || "");
+    const cmid = cmidMatch ? parseInt(cmidMatch[1], 10) : e.id;
+    const evCourse = e.course?.id || cursoId;
+    if (!incluirCerradas && !cursoId && activeCourseIds && evCourse && !activeCourseIds.has(evCourse)) continue;
+    itemsToProcess.push({
+      modulename: e.modulename,
+      id: cmid || e.id,
+      cmid,
+      name: e.activityname || e.name,
+      duedate: e.timesort,
+      courseId: e.course?.id || cursoId,
+      courseName: e.course?.fullname,
+      description: e.description,
+      actionable: e.action?.actionable
+    });
   }
 
-  // 3. Consultar submission_status en lotes (batch de 10) paralelizados vía Promise.all
-  const MAX_TASKS_TO_QUERY = 40;
-  const BATCH_SIZE = 10;
-  const statusResults = new Map<number, { estadoEntrega: string; submissionGrade?: string }>();
-  // Priorizar tareas con vencimiento próximo antes de cortar el lote a consultar
-  itemsToProcess.sort((a, b) => {
-    const aDue = a.duedate > 0 ? a.duedate : Infinity;
-    const bDue = b.duedate > 0 ? b.duedate : Infinity;
-    return aDue - bDue;
-  });
-  const tasksToQuery = itemsToProcess.filter((item) => item.assignId).slice(0, MAX_TASKS_TO_QUERY);
-  const chunks: Array<typeof tasksToQuery> = [];
-  for (let i = 0; i < tasksToQuery.length; i += BATCH_SIZE) {
-    chunks.push(tasksToQuery.slice(i, i + BATCH_SIZE));
-  }
-
-  await Promise.all(
-    chunks.map(async (chunk) => {
-      const calls = chunk.map((item) => ({
-        methodname: "mod_assign_get_submission_status",
-        args: { assignid: item.assignId! }
-      }));
-
-      try {
-        const batchRes = await evaAjaxBatch<{
-          lastattempt?: { submission?: { status?: string } };
-          feedback?: { grade?: { grade?: string } };
-        }>(calls);
-
-        chunk.forEach((item, idx) => {
-          const estaVencida = Boolean(item.duedate > 0 && item.duedate < nowUnix);
-          let estadoEntrega = estaVencida ? "No entregada (vencida)" : "Pendiente de entrega";
-          let submissionGrade: string | undefined;
-
-          const subRes = batchRes[idx];
-          if (subRes && !subRes.error && subRes.data) {
-            const subStatus = subRes.data;
-            const statusStr = subStatus?.lastattempt?.submission?.status;
-            if (statusStr === "submitted") {
-              estadoEntrega = "Enviado para calificar";
-            } else if (statusStr === "draft") {
-              estadoEntrega = "Borrador (no enviado)";
-            } else if (statusStr === "new" || statusStr === "reopened") {
-              estadoEntrega = estaVencida ? "No entregada (vencida)" : "Pendiente de entrega";
-            }
-            if (subStatus?.feedback?.grade?.grade) {
-              submissionGrade = subStatus.feedback.grade.grade;
-            }
-          }
-          statusResults.set(item.cmid, { estadoEntrega, submissionGrade });
-        });
-      } catch (err) {
-        if (err instanceof SessionExpiredError) throw err;
-        for (const item of chunk) {
-          const estaVencida = Boolean(item.duedate > 0 && item.duedate < nowUnix);
-          statusResults.set(item.cmid, {
-            estadoEntrega: estaVencida ? "No entregada (vencida)" : "Pendiente de entrega"
-          });
-        }
-      }
+  // Estado de entrega: se lee desde la página de cada tarea
+  // (solo para las tareas más próximas, en paralelo y acotado para no demorar la respuesta)
+  const statusResults = new Map<number, { estadoEntrega: string }>();
+  itemsToProcess.sort((a, b) => (a.duedate > 0 ? a.duedate : Infinity) - (b.duedate > 0 ? b.duedate : Infinity));
+  const sinEstado = itemsToProcess
+    .filter((i) => i.modulename === "assign" && i.duedate >= nowUnix - 86400 && i.duedate <= nowUnix + 30 * 86400)
+    .slice(0, 6);
+  await Promise.allSettled(
+    sinEstado.map(async (item) => {
+      const res = await evaFetch(`/mod/assign/view.php?id=${item.cmid}`);
+      const $a = cheerio.load(await res.text());
+      let estadoTxt = "";
+      let notaTxt = "";
+      $a("table.generaltable tr").each((_, tr) => {
+        const row = $a(tr).text().replace(/\s+/g, " ").trim();
+        if (/^Estado de la entrega/i.test(row)) estadoTxt = row.replace(/^Estado de la entrega\s*/i, "");
+        if (/^Estado de la calificaci[oó]n/i.test(row)) notaTxt = row.replace(/^Estado de la calificaci[oó]n\s*/i, "");
+      });
+      if (!estadoTxt) return;
+      const vencida = item.duedate > 0 && item.duedate < nowUnix;
+      let estadoEntrega: string;
+      if (/Enviado para calificar/i.test(estadoTxt)) estadoEntrega = /^Calificado/i.test(notaTxt) ? "Calificada" : "Enviado para calificar";
+      else if (/Borrador/i.test(estadoTxt)) estadoEntrega = "Borrador (no enviado)";
+      else if (/no se han realizado|sin intento|no hay intento/i.test(estadoTxt)) estadoEntrega = vencida ? "No entregada (vencida)" : "Pendiente de entrega";
+      else return;
+      statusResults.set(item.cmid, { estadoEntrega });
     })
   );
 
@@ -594,7 +483,6 @@ export async function getTareasYNotas(
     const estaVencida = Boolean(item.duedate > 0 && item.duedate < nowUnix);
     const statusInfo = statusResults.get(item.cmid);
     const estadoEntrega = statusInfo ? statusInfo.estadoEntrega : "desconocido";
-    const submissionGrade = statusInfo?.submissionGrade;
     const descSnippet = item.description ? capSnippet(cheerio.load(item.description).text().trim(), 500) : "";
 
     tareas.push({
@@ -612,112 +500,55 @@ export async function getTareasYNotas(
       fechaLimiteUnix: item.duedate,
       permiteEntregas: Boolean(item.actionable !== undefined ? item.actionable : !estaVencida),
       estadoEntrega,
-      calificacion: submissionGrade,
       descripcion: descSnippet ? wrapUntrustedContent(descSnippet, "eva_descripcion_tarea") : undefined
     });
   }
 
-  // 3. Si se consultó un curso específico, enriquecer desde el libro de calificaciones oficial con matching estricto
+  // Si se consultó un curso específico, enriquecer desde el libro de calificaciones (gradereport_user_get_grade_items está deshabilitado en EVA: se lee la página)
   if (cursoId) {
-    let rpcGradesLoaded = false;
     try {
-      const gradeData = await evaAjaxRpc<{
-        usergrades?: Array<{
-          gradeitems?: Array<{
-            id: number;
-            itemname: string;
-            cmid?: number;
-            gradeformatted?: string;
-            grademin?: number;
-            grademax?: number;
-          }>;
-        }>;
-      }>("gradereport_user_get_grade_items", { courseid: cursoId });
+      const gradeHtml = await gradePage!;
+      const $g = cheerio.load(gradeHtml);
 
-      const items = gradeData?.usergrades?.[0]?.gradeitems;
-      if (items && Array.isArray(items)) {
-        rpcGradesLoaded = true;
-        for (const gi of items) {
-          if (!gi.itemname || gi.itemname.includes("Total del curso")) continue;
-          const cleanNota = (gi.gradeformatted || "").trim();
-          const hasNota = cleanNota && cleanNota !== "-";
+      $g("table.user-grade tbody tr").each((_, tr) => {
+        let itemName = $g(tr).find(".itemname, th").first().text().replace(/\s+/g, " ").trim();
+        itemName = itemName.replace(/^(Tarea|Cuestionario|Foro|Taller|Lección)/i, "").trim();
+        const rawGrade = $g(tr).find(".grade, td.column-grade").first().text().replace(/\s+/g, " ").trim();
+        const rawRange = $g(tr).find(".range, td.column-range").first().text().replace(/\s+/g, " ").trim();
 
-          // Matching estricto por cmid, con fallback a coincidencia exacta de nombre
-          const cleanItemName = gi.itemname.trim().toLowerCase();
-          const match = tareas.find(
-            (t) => (gi.cmid && t.cmid > 0 && t.cmid === gi.cmid) || t.nombre.trim().toLowerCase() === cleanItemName
-          );
+        if (!itemName || itemName === "&nbsp;" || itemName.includes("Total del curso")) return;
 
-          if (match) {
-            if (hasNota) {
-              match.calificacion = cleanNota;
-              match.estadoEntrega = "Calificada";
-            }
-            if (gi.grademax) match.rangoCalificacion = `${gi.grademin || 0}-${gi.grademax}`;
-          } else if (incluirCerradas || hasNota) {
-            tareas.push({
-              id: gi.id || tareas.length + 1000,
-              cmid: gi.cmid || 0,
-              nombre: gi.itemname,
-              materiaId: cursoId,
-              fechaVencimiento: null,
-              fechaLimiteUnix: 0,
-              permiteEntregas: false,
-              calificacion: hasNota ? cleanNota : undefined,
-              rangoCalificacion: gi.grademax ? `${gi.grademin || 0}-${gi.grademax}` : undefined,
-              estadoEntrega: hasNota ? "Calificada" : "Finalizada"
-            });
+        const cleanGrade = rawGrade.split(" ")[0].trim();
+        const hasNota = cleanGrade && cleanGrade !== "-";
+
+        // Matching estricto por igualdad exacta (evita "TP 1" coincidiendo erróneamente con "TP 10")
+        const targetNameLower = itemName.toLowerCase();
+        const match = tareas.find((t) => t.nombre.toLowerCase() === targetNameLower);
+
+        if (match) {
+          if (hasNota) {
+            match.calificacion = cleanGrade;
+            match.estadoEntrega = "Calificada";
           }
+          if (rawRange) match.rangoCalificacion = rawRange;
+        } else if (incluirCerradas || hasNota) {
+          tareas.push({
+            id: tareas.length + 1000,
+            cmid: 0,
+            nombre: itemName,
+            materiaId: cursoId,
+            fechaVencimiento: null,
+            fechaLimiteUnix: 0,
+            permiteEntregas: false,
+            calificacion: hasNota ? cleanGrade : undefined,
+            rangoCalificacion: rawRange || undefined,
+            estadoEntrega: hasNota ? "Calificada" : "Finalizada"
+          });
         }
-      }
-    } catch {}
-
-    if (!rpcGradesLoaded) {
-      try {
-        const gradeRes = await evaFetch(`/grade/report/user/index.php?id=${cursoId}`);
-        const gradeHtml = await gradeRes.text();
-        const $g = cheerio.load(gradeHtml);
-
-        $g("table.user-grade tbody tr").each((_, tr) => {
-          let itemName = $g(tr).find(".itemname, th").first().text().replace(/\s+/g, " ").trim();
-          itemName = itemName.replace(/^(Tarea|Cuestionario|Foro|Taller|Lección)/i, "").trim();
-          const rawGrade = $g(tr).find(".grade, td.column-grade").first().text().replace(/\s+/g, " ").trim();
-          const rawRange = $g(tr).find(".range, td.column-range").first().text().replace(/\s+/g, " ").trim();
-
-          if (!itemName || itemName === "&nbsp;" || itemName.includes("Total del curso")) return;
-
-          const cleanGrade = rawGrade.split(" ")[0].trim();
-          const hasNota = cleanGrade && cleanGrade !== "-";
-
-          // Matching estricto por igualdad exacta (evita "TP 1" coincidiendo erróneamente con "TP 10")
-          const targetNameLower = itemName.toLowerCase();
-          const match = tareas.find((t) => t.nombre.toLowerCase() === targetNameLower);
-
-          if (match) {
-            if (hasNota) {
-              match.calificacion = cleanGrade;
-              match.estadoEntrega = "Calificada";
-            }
-            if (rawRange) match.rangoCalificacion = rawRange;
-          } else if (incluirCerradas || hasNota) {
-            tareas.push({
-              id: tareas.length + 1000,
-              cmid: 0,
-              nombre: itemName,
-              materiaId: cursoId,
-              fechaVencimiento: null,
-              fechaLimiteUnix: 0,
-              permiteEntregas: false,
-              calificacion: hasNota ? cleanGrade : undefined,
-              rangoCalificacion: rawRange || undefined,
-              estadoEntrega: hasNota ? "Calificada" : "Finalizada"
-            });
-          }
-        });
-      } catch (err) {
-        if (err instanceof SessionExpiredError) throw err;
-        logger.warn(`No se pudieron obtener calificaciones para el curso ${cursoId}: ${err}`);
-      }
+      });
+    } catch (err) {
+      if (err instanceof SessionExpiredError) throw err;
+      logger.warn(`No se pudieron obtener calificaciones para el curso ${cursoId}: ${err}`);
     }
   }
 
@@ -733,93 +564,26 @@ export async function getTareasYNotas(
   return tareas;
 }
 
-// 4. Obtener novedades y foros de discusión (con RPC rápido y scraping de respaldo)
-export async function getForos(cursoId?: number, limit = 10): Promise<ForoItem[]> {
+// 4. Obtener novedades y foros de discusión (scraping)
+export async function getForos(cursoId?: number, limit = 10, forzarRefresco = false): Promise<ForoItem[]> {
+  return ttlCached(`foros:${cursoId ?? "all"}:${limit}`, 60_000, forzarRefresco, () => getForosSinCache(cursoId, limit));
+}
+
+async function getForosSinCache(cursoId?: number, limit = 10): Promise<ForoItem[]> {
   const targetCursos: Array<{ id: number; nombre?: string }> = cursoId
     ? [{ id: cursoId }]
     : await getMaterias();
 
-  // 1. Intento por servicios oficiales Moodle (mod_forum_get_forums_by_courses + mod_forum_get_forum_discussions)
-  try {
-    const courseIds = targetCursos.map((c) => c.id);
-    const forumsData = await evaAjaxRpc<Array<{ id: number; course: number; name: string; type: string }>>(
-      "mod_forum_get_forums_by_courses",
-      { courseids: courseIds }
-    );
-
-    if (Array.isArray(forumsData) && forumsData.length > 0) {
-      // Priorizar foros de novedades/avisos (type: "news")
-      const sortedForums = [...forumsData].sort((a, b) => {
-        const aIsNews = a.type === "news" ? 1 : 0;
-        const bIsNews = b.type === "news" ? 1 : 0;
-        return bIsNews - aIsNews;
-      });
-      const activeForums = sortedForums.slice(0, 15);
-      const calls = activeForums.map((f) => ({
-        methodname: "mod_forum_get_forum_discussions",
-        args: { forumid: f.id, perpage: limit }
-      }));
-
-      const batchResults = await evaAjaxBatch<{
-        discussions?: Array<{
-          id: number;
-          name?: string;
-          subject?: string;
-          message: string;
-          userfullname?: string;
-          modified?: number;
-          timemodified?: number;
-        }>;
-      }>(calls);
-
-      const discussionsLists = batchResults.map((r, idx) => {
-        if (r.error || !r.data?.discussions) return [];
-        const forum = activeForums[idx];
-        const cursoNombre = targetCursos.find((c) => c.id === forum.course)?.nombre;
-        return r.data.discussions.map((d) => {
-          const modTimestamp = d.modified || d.timemodified || 0;
-          return {
-            id: (d as any).discussion ?? d.id,
-            modified: modTimestamp,
-            asunto: (d.name || d.subject || "Aviso").replace(/[\r\n<>]/g, " ").trim(),
-            autor: (d.userfullname || "Cátedra").replace(/[\r\n<>]/g, " ").trim(),
-            fecha: modTimestamp ? new Date(modTimestamp * 1000).toLocaleString("es-AR") : "Reciente",
-            mensaje: wrapUntrustedContent(
-              capSnippet(cheerio.load(d.message || "").text().trim(), 800),
-              `eva_foro_${d.id}`
-            ),
-            cursoNombre
-          };
-        });
-      });
-
-      const combined = discussionsLists.flat();
-      if (combined.length > 0) {
-        // Ordenar discusiones cronológicamente descendente (las más recientes primero)
-        combined.sort((a, b) => (b.modified || 0) - (a.modified || 0));
-        return combined.slice(0, limit).map(({ modified, ...rest }) => rest);
-      }
-    }
-  } catch (err) {
-    if (err instanceof SessionExpiredError) throw err;
-    // Continuar a scraping de respaldo
-  }
-
-  // 2. Scraping de respaldo paralelizado (acotado a 2 cursos y 1 foro por curso para no saturar timeouts)
+  // Scraping paralelo (mod_forum_get_forums_by_courses / mod_forum_get_forum_discussions están deshabilitados en EVA): hasta 4 cursos, 1 foro de avisos por curso; reutiliza el contenido cacheado
   const items: ForoItem[] = [];
   const courseResults = await Promise.all(
-    targetCursos.slice(0, 2).map(async (curso) => {
+    targetCursos.slice(0, 4).map(async (curso) => {
       const courseItems: ForoItem[] = [];
       try {
-        const cRes = await evaFetch(`/course/view.php?id=${curso.id}`);
-        const cHtml = await cRes.text();
-        const $c = cheerio.load(cHtml);
-
-        const forumUrls: string[] = [];
-        $c('a[href*="/mod/forum/view.php"]').each((_, a) => {
-          const href = $c(a).attr("href");
-          if (href && !forumUrls.includes(href)) forumUrls.push(href);
-        });
+        const secciones = await getContenidoCurso(curso.id);
+        const foros = secciones.flatMap((s) => s.modulos).filter((m) => m.tipo === "forum" && m.url);
+        const avisos = foros.find((m) => /aviso|novedad|anuncio/i.test(m.nombre)) || foros[0];
+        const forumUrls: string[] = avisos?.url ? [avisos.url] : [];
 
         for (const forumUrl of forumUrls.slice(0, 1)) {
           const fRes = await evaFetch(forumUrl);
@@ -843,37 +607,14 @@ export async function getForos(cursoId?: number, limit = 10): Promise<ForoItem[]
             }
           });
 
-          const discResults = await Promise.allSettled(
-            discussionLinks.map(async (disc) => {
-              const dRes = await evaFetch(disc.url);
-              const dHtml = await dRes.text();
-              const parsed = parseForosFromHtml(dHtml);
-              if (parsed.length > 0) {
-                const item = parsed[0];
-                item.id = disc.id;
-                item.cursoNombre = curso.nombre;
-                if (!item.asunto || item.asunto.includes("Aviso")) {
-                  item.asunto = disc.topic;
-                }
-                return item;
-              }
-              return {
-                id: disc.id,
-                asunto: disc.topic,
-                autor: disc.author || "Cátedra",
-                fecha: "Reciente",
-                mensaje: `[Ver en EVA: ${disc.url}]`,
-                cursoNombre: curso.nombre
-              };
-            })
-          );
+          // Un solo POST AJAX con el primer mensaje de cada discusión (~0,3 s, vs ~1 s de cargar cada página)
+          const postsRes = await evaAjaxBatch<{
+            posts?: Array<{ subject?: string; message?: string; author?: { fullname?: string }; timecreated?: number }>;
+          }>(discussionLinks.map((disc) => ({ methodname: "mod_forum_get_discussion_posts", args: { discussionid: disc.id } })));
 
-          for (let i = 0; i < discResults.length; i++) {
-            const r = discResults[i];
-            if (r.status === "fulfilled") {
-              courseItems.push(r.value);
-            } else {
-              const disc = discussionLinks[i];
+          discussionLinks.forEach((disc, i) => {
+            const post = postsRes[i]?.data?.posts?.[0];
+            if (!post) {
               courseItems.push({
                 id: disc.id,
                 asunto: disc.topic,
@@ -882,8 +623,19 @@ export async function getForos(cursoId?: number, limit = 10): Promise<ForoItem[]
                 mensaje: `[Ver en EVA: ${disc.url}]`,
                 cursoNombre: curso.nombre
               });
+              return;
             }
-          }
+            courseItems.push({
+              id: disc.id,
+              asunto: (post.subject || disc.topic).replace(/[\r\n<>]/g, " ").trim(),
+              autor: (post.author?.fullname || disc.author || "Cátedra").replace(/[\r\n<>]/g, " ").trim(),
+              fecha: post.timecreated
+                ? new Date(post.timecreated * 1000).toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" })
+                : "Reciente",
+              mensaje: wrapUntrustedContent(capSnippet(cheerio.load(post.message || "").text().trim(), 800), `eva_foro_${disc.id}`),
+              cursoNombre: curso.nombre
+            });
+          });
         }
       } catch (err) {
         if (err instanceof SessionExpiredError) throw err;
@@ -1050,7 +802,11 @@ export interface CuestionarioInfo {
 }
 
 // 6. Obtener cuestionarios online y exámenes parciales de EVA Moodle (Lectura pura - sin interactuar con respuestas)
-export async function getCuestionarios(cursoId?: number): Promise<CuestionarioInfo[]> {
+export async function getCuestionarios(cursoId?: number, forzarRefresco = false): Promise<CuestionarioInfo[]> {
+  return ttlCached(`quiz:${cursoId ?? "all"}`, 60_000, forzarRefresco, () => getCuestionariosSinCache(cursoId));
+}
+
+async function getCuestionariosSinCache(cursoId?: number): Promise<CuestionarioInfo[]> {
   const candidateQuizzes: Array<{ cmid: number; nombre: string; cursoId?: number; cursoNombre?: string; url: string }> = [];
 
   if (cursoId) {
@@ -1068,9 +824,19 @@ export async function getCuestionarios(cursoId?: number): Promise<CuestionarioIn
       }
     }
   } else {
+    // Contenido de las materias activas en paralelo con el calendario: solo se usa si el calendario no trae cuestionarios
+    // (getContenidoCurso cachea el resultado, así que el bucle posterior no genera red)
+    const contenidoTask = (async () => {
+      const activeCourses = (await getMaterias(false)).slice(0, 4);
+      await Promise.allSettled(activeCourses.map((c) => getContenidoCurso(c.id)));
+      return activeCourses;
+    })();
+    contenidoTask.catch(() => {});
+
     try {
       const calData = await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_timesort", {
-        timesortfrom: 0,
+        timesortfrom: Math.floor(Date.now() / 1000) - 30 * 86400,
+        timesortto: Math.floor(Date.now() / 1000) + 180 * 86400,
         limitnum: 50
       });
       for (const e of calData?.events || []) {
@@ -1088,9 +854,8 @@ export async function getCuestionarios(cursoId?: number): Promise<CuestionarioIn
       }
     } catch {}
 
-    if (candidateQuizzes.length < 5) {
-      const activeCourses = await getMaterias(false);
-      for (const c of activeCourses.slice(0, 4)) {
+    if (candidateQuizzes.length === 0) {
+      for (const c of await contenidoTask) {
         try {
           const secciones = await getContenidoCurso(c.id);
           for (const sec of secciones) {
@@ -1272,8 +1037,10 @@ export async function getCronogramaMateria(materia: string): Promise<CronogramaM
         fullText = await extractXlsxText(file.buffer);
       } else if (file.filename.toLowerCase().endsWith(".odt") || file.filename.toLowerCase().endsWith(".ods")) {
         fullText = await extractOdfText(file.buffer);
-      } else {
+      } else if (file.filename.toLowerCase().endsWith(".txt") || file.filename.toLowerCase().endsWith(".csv") || file.mimeType.startsWith("text/")) {
         fullText = new TextDecoder("utf-8", { fatal: false }).decode(file.buffer);
+      } else {
+        fullText = `[Formato no soportado para extracción directa de texto: ${file.filename}]`;
       }
 
       const lineas = fullText
@@ -1415,4 +1182,17 @@ export async function getEntregasProximas(
     avisosRecientes,
     mensaje
   };
+}
+
+// Lee el contenido de una actividad de tipo "Página" (mod/page), que no es un archivo descargable
+export async function getPaginaEva(cmid: number): Promise<{ titulo: string; texto: string } | null> {
+  const res = await evaFetch(`/mod/page/view.php?id=${cmid}`);
+  if (!res.ok) return null;
+  const $ = cheerio.load(await res.text());
+  const body = $("#region-main .box.generalbox, #region-main [role='main'], #region-main").first();
+  body.find("script, style, nav, .activity-navigation, .modified").remove();
+  const texto = body.text().replace(/[ \t]+/g, " ").replace(/\n\s*\n+/g, "\n\n").trim();
+  if (!texto) return null;
+  const titulo = $("h1").first().text().replace(/\s+/g, " ").trim() || `Página ${cmid}`;
+  return { titulo, texto };
 }

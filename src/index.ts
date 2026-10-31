@@ -17,6 +17,8 @@ async function main() {
   const cleanup = async (code = 0) => {
     if (isCleaningUp) return;
     isCleaningUp = true;
+    // Salida forzada: un cierre de navegador colgado no debe dejar el proceso huérfano ni demorar al cliente
+    setTimeout(() => process.exit(code), 3000).unref();
     try {
       flushPendingSessionSave();
       await closeAllActiveContexts();
@@ -48,8 +50,14 @@ async function main() {
     import("./auth/session.js").then(({ loadEncryptedSession }) => {
       const session = loadEncryptedSession();
       if (session?.moodleSession) {
-        import("./eva/client.js").then(({ getMaterias }) => {
-          getMaterias(false).catch(() => {});
+        import("./eva/client.js").then(({ getMaterias, getContenidoCurso, getTareasYNotas, getForos, getCuestionarios }) => {
+          // Precarga de las materias activas (contenido es liviano vía AJAX): acelera foros, cuestionarios, tareas, resumen y búsqueda
+          getMaterias(false)
+            .then(async (materias) => {
+              await Promise.allSettled(materias.slice(0, 8).map((m) => getContenidoCurso(m.id)));
+              await Promise.allSettled([getTareasYNotas(undefined, false), getForos(undefined, 10), getCuestionarios()]);
+            })
+            .catch(() => {});
         }).catch(() => {});
       }
       if (session?.siuSession) {

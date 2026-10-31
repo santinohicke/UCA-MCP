@@ -16,7 +16,8 @@ import {
   getCuestionarios,
   getCronogramaMateria,
   getEntregasProximas,
-  getHiloForo
+  getHiloForo,
+  getPaginaEva
 } from "./eva/client.js";
 import {
   getEstadoCursada,
@@ -27,7 +28,8 @@ import {
   getEncuestasPendientes,
   getProgresoCarrera,
   getHorarioSemanal,
-  getPlanOptimo
+  getPlanOptimo,
+  getCronogramaEvaluaciones
 } from "./guarani/client.js";
 import { getArancelesYTramites } from "./campus/client.js";
 import { getResumenSemanal } from "./resumen/client.js";
@@ -111,6 +113,7 @@ export interface ServerServices {
   getHiloForo?: typeof getHiloForo;
   getHorarioSemanal?: typeof getHorarioSemanal;
   getPlanOptimo?: typeof getPlanOptimo;
+  getCronogramaEvaluaciones?: typeof getCronogramaEvaluaciones;
   downloadSecureFile?: typeof downloadSecureFile;
   guardarBorradorTarea?: typeof guardarBorradorTarea;
   responderForo?: typeof responderForo;
@@ -142,6 +145,7 @@ export function createServer(services: ServerServices = {}): McpServer {
   const _getHiloForo = services.getHiloForo || getHiloForo;
   const _getHorarioSemanal = services.getHorarioSemanal || getHorarioSemanal;
   const _getPlanOptimo = services.getPlanOptimo || getPlanOptimo;
+  const _getCronogramaEvaluaciones = services.getCronogramaEvaluaciones || getCronogramaEvaluaciones;
   const _downloadSecureFile = services.downloadSecureFile || downloadSecureFile;
   const _guardarBorradorTarea = services.guardarBorradorTarea || guardarBorradorTarea;
   const _responderForo = services.responderForo || responderForo;
@@ -170,6 +174,25 @@ export function createServer(services: ServerServices = {}): McpServer {
         "- Las mutaciones están protegidas por Canal B (diálogo modal nativo del sistema operativo) y requieren autorización física del usuario."
     }
   );
+
+
+  // Compacidad y compatibilidad: no se emite outputSchema ni structuredContent (duplicaban el texto y
+  // algunos clientes estrictos rechazan esquemas de salida). Todo el contenido útil viaja en content[].
+  // Además todas las herramientas hablan con sistemas externos de la UCA: openWorldHint siempre true.
+  {
+    const originalRegisterTool = (server.registerTool as any).bind(server);
+    (server as any).registerTool = (name: string, config: any, cb: any) => {
+      const { outputSchema: _omit, ...rest } = config;
+      const annotations = { ...(rest.annotations || {}), openWorldHint: true };
+      return originalRegisterTool(name, { ...rest, annotations }, async (...args: any[]) => {
+        const result = await cb(...args);
+        if (result && typeof result === "object" && "structuredContent" in result) {
+          delete result.structuredContent;
+        }
+        return result;
+      });
+    };
+  }
 
   // Registro de Canal A (Elicitation MCP) si el cliente conectado lo soporta
   setElicitationHandler(async (details) => {
@@ -257,7 +280,7 @@ export function createServer(services: ServerServices = {}): McpServer {
       inputSchema: {},
       outputSchema: {
         servidor: z.any(),
-        conectividad: z.record(z.string()),
+        conectividad: z.record(z.string(), z.string()),
         almacenamiento: z.any(),
         sesion: z.any(),
         entorno: z.any()
@@ -291,14 +314,14 @@ export function createServer(services: ServerServices = {}): McpServer {
         }
 
         try {
-          const res = await guaraniFetch("/inicio_alumno", { method: "HEAD" }, false);
+          const res = await guaraniFetch("/inicio_alumno", { method: "GET" }, false);
           conectividad.guarani = res.ok ? "conectado" : `http_${res.status}`;
         } catch (e: any) {
           conectividad.guarani = `error: ${e.message}`;
         }
 
         try {
-          const res = await campusFetch("/", { method: "HEAD" });
+          const res = await campusFetch("/", { method: "GET" });
           conectividad.campus = res.ok ? "conectado" : `http_${res.status}`;
         } catch (e: any) {
           conectividad.campus = `error: ${e.message}`;
@@ -375,7 +398,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         try {
           await evaFetch("/my/", { method: "GET" }, false);
           if (existingSession.siuSession) {
-            await guaraniFetch("/inicio_alumno", { method: "HEAD" }, false);
+            await guaraniFetch("/inicio_alumno", { method: "GET" }, false);
           }
           const resObj = {
             estado: "SESION_ACTIVA",
@@ -529,7 +552,7 @@ export function createServer(services: ServerServices = {}): McpServer {
       title: "Contenido del Curso en EVA",
       description: "Lista las secciones, módulos, tareas y recursos pertenecientes a un curso en EVA. Permite filtrar por tipo o sección para presupuestar contexto.",
       inputSchema: {
-        curso_id: z.number().int().positive().describe("ID numérico del curso en EVA"),
+        curso_id: z.number().int().min(1).describe("ID numérico del curso en EVA"),
         filtro_tipo: z
           .string()
           .optional()
@@ -580,7 +603,7 @@ export function createServer(services: ServerServices = {}): McpServer {
       title: "Tareas y Notas en EVA",
       description: "Obtiene tareas, plazos de entrega, estado de entregas y fechas límite en EVA Moodle.",
       inputSchema: {
-        curso_id: z.number().int().positive().optional().describe("ID del curso (opcional, omite para todas las materias)"),
+        curso_id: z.number().int().min(1).optional().describe("ID del curso (opcional, omite para todas las materias)"),
         incluir_cerradas: z.boolean().optional().default(false).describe("Si es true, incluye tareas vencidas")
       },
       outputSchema: {
@@ -620,8 +643,9 @@ export function createServer(services: ServerServices = {}): McpServer {
       title: "Foros y Avisos en EVA",
       description: "Obtiene los últimos avisos institucionales y mensajes de foros de cátedra (etiquetados con aviso de seguridad).",
       inputSchema: {
-        curso_id: z.number().int().positive().optional().describe("ID del curso (opcional)"),
-        limit: z.number().int().positive().max(50).optional().default(10).describe("Cantidad máxima de mensajes (máx 50)")
+        curso_id: z.number().int().min(1).optional().describe("ID del curso (opcional)"),
+        limit: z.number().int().min(1).max(50).optional().default(10).describe("Cantidad máxima de mensajes (máx 50)"),
+        forzar_refresco: z.boolean().optional().default(false).describe("Si es true, ignora la caché de 45-60 s y consulta de nuevo")
       },
       outputSchema: {
         foros: z.array(z.any()),
@@ -631,11 +655,11 @@ export function createServer(services: ServerServices = {}): McpServer {
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true }
     },
-    async ({ curso_id, limit }, extra) => {
+    async ({ curso_id, limit, forzar_refresco }, extra) => {
       const reportProgress = createProgressReporter(extra);
       await reportProgress(20, 100, "Consultando foros y debates de cátedra...");
       try {
-        const foros = await _getForos(curso_id, limit);
+        const foros = await _getForos(curso_id, limit, forzar_refresco);
         const truncado = foros.length >= (limit || 10);
         const struct = {
           foros,
@@ -668,7 +692,7 @@ export function createServer(services: ServerServices = {}): McpServer {
       title: "Hilo Completo de Foro en EVA",
       description: "Obtiene el debate o hilo completo de un foro de cátedra en EVA Moodle, incluyendo todas las respuestas y mensajes ordenados.",
       inputSchema: {
-        discusion_id: z.number().int().positive().describe("ID numérico del debate o discusión del foro en EVA")
+        discusion_id: z.number().int().min(1).describe("ID numérico del debate o discusión del foro en EVA")
       },
       outputSchema: {
         discusionId: z.number(),
@@ -706,32 +730,42 @@ export function createServer(services: ServerServices = {}): McpServer {
       description: "Busca recursos, consignas y documentos en EVA por palabra clave.",
       inputSchema: {
         query: z.string().min(1).max(100).describe("Término de búsqueda (1-100 caracteres)"),
-        curso_id: z.number().int().positive().optional().describe("ID del curso (opcional)")
+        curso_id: z.number().int().min(1).optional().describe("ID del curso (opcional)"),
+        limite: z.number().int().min(1).max(200).optional().default(25).describe("Máximo de resultados a devolver (por defecto 25)")
       },
       outputSchema: {
         query: z.string(),
         resultados: z.array(z.any()),
-        total: z.number()
+        total: z.number(),
+        mostrados: z.number().optional(),
+        nota: z.string().optional()
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true }
     },
-    async ({ query, curso_id }, extra) => {
+    async ({ query, curso_id, limite }, extra) => {
       const reportProgress = createProgressReporter(extra);
       await reportProgress(20, 100, `Buscando '${query}' en aulas virtuales...`);
       try {
-        const resultados = await _buscarMateriales(query, curso_id);
+        const todos = await _buscarMateriales(query, curso_id);
         await reportProgress(100, 100, "Búsqueda finalizada.");
+        const max = limite ?? 25;
+        const resultados = todos.slice(0, max).map((r) => (r.nombre.length > 140 ? { ...r, nombre: r.nombre.slice(0, 137) + "..." } : r));
+        const nota = todos.length > resultados.length
+          ? `Se muestran ${resultados.length} de ${todos.length} coincidencias. Refiná la búsqueda, filtrá con 'curso_id' o subí 'limite' (máx 200) para ver más.`
+          : undefined;
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(resultados)
+              text: JSON.stringify({ resultados, total: todos.length, ...(nota ? { nota } : {}) })
             }
           ],
           structuredContent: {
             query,
             resultados,
-            total: resultados.length
+            total: todos.length,
+            mostrados: resultados.length,
+            ...(nota ? { nota } : {})
           }
         };
       } catch (err) {
@@ -748,9 +782,9 @@ export function createServer(services: ServerServices = {}): McpServer {
       description: "Descarga de forma segura (con allowlist HTTPS) y extrae texto de PDFs y Office, o retorna bloques de imagen en escaneados. Nota: La consulta de recursos o carpetas en EVA registra la visualización en la plataforma.",
       inputSchema: {
         url: z.string().optional().describe("URL completa del archivo o recurso en EVA (debe pertenecer a eva.uca.edu.ar)"),
-        cmid: z.number().int().positive().optional().describe("ID numérico de la actividad o recurso (cmid) alternativo a la URL"),
-        desde_pagina: z.number().int().positive().optional().default(1).describe("Página inicial desde donde extraer contenido (por defecto 1)"),
-        max_paginas: z.number().int().positive().max(50).optional().default(15).describe("Límite de páginas a extraer (máx 50)"),
+        cmid: z.number().int().min(1).optional().describe("ID numérico de la actividad o recurso (cmid) alternativo a la URL"),
+        desde_pagina: z.number().int().min(1).optional().default(1).describe("Página inicial desde donde extraer contenido (por defecto 1)"),
+        max_paginas: z.number().int().min(1).max(50).optional().default(15).describe("Límite de páginas a extraer (máx 50)"),
         forzar_refresco: z.boolean().optional().default(false).describe("Si es true, omite la caché local y vuelve a descargar el archivo de EVA")
       },
       outputSchema: {
@@ -772,7 +806,41 @@ export function createServer(services: ServerServices = {}): McpServer {
           throw new Error("Debés especificar al menos 'url' o 'cmid' para identificar el archivo a descargar.");
         }
 
-        const file = await _downloadSecureFile(targetUrl, 0, forzar_refresco);
+        const pageCmid = url
+          ? Number(/\/mod\/page\/view\.php\?(?:[^#]*&)?id=(\d+)/.exec(url)?.[1])
+          : undefined;
+        const leerPagina = async () => {
+          const id = pageCmid || cmid;
+          const pagina = id ? await getPaginaEva(id) : null;
+          if (!pagina) return null;
+          await reportProgress(100, 100, "Lectura de página completada.");
+          return {
+            content: [{ type: "text" as const, text: wrapUntrustedContent(capExtractedText(pagina.texto), pagina.titulo) }],
+            structuredContent: {
+              filename: pagina.titulo,
+              mimeType: "text/html",
+              tamanoBytes: Buffer.byteLength(pagina.texto),
+              tipo: "page"
+            }
+          };
+        };
+
+        if (pageCmid) {
+          const pagina = await leerPagina();
+          if (pagina) return pagina;
+        }
+
+        let file;
+        try {
+          file = await _downloadSecureFile(targetUrl, 0, forzar_refresco);
+        } catch (downloadErr) {
+          // Un cmid puede corresponder a una actividad "Página" en vez de un recurso descargable
+          if (!url && cmid) {
+            const pagina = await leerPagina();
+            if (pagina) return pagina;
+          }
+          throw downloadErr;
+        }
         await reportProgress(50, 100, "Extrayendo contenido del archivo...");
         const nameLower = file.filename.toLowerCase();
 
@@ -950,21 +1018,22 @@ export function createServer(services: ServerServices = {}): McpServer {
       title: "Cuestionarios y Exámenes Parciales en EVA",
       description: "Consulta cuestionarios, exámenes parciales online, fechas de apertura/cierre, intentos y calificaciones en EVA Moodle (Lectura pura).",
       inputSchema: {
-        curso_id: z.number().int().positive().optional().describe("ID del curso en EVA. Si se omite, busca cuestionarios activos en el calendario y materias actuales.")
+        curso_id: z.number().int().min(1).optional().describe("ID del curso en EVA. Si se omite, busca cuestionarios activos en el calendario y materias actuales."),
+        forzar_refresco: z.boolean().optional().default(false).describe("Si es true, ignora la caché de 45-60 s y consulta de nuevo")
       },
       outputSchema: {
         cuestionarios: z.array(z.any())
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true }
     },
-    async ({ curso_id }, extra) => {
+    async ({ curso_id, forzar_refresco }, extra) => {
       const reportProgress = createProgressReporter(extra);
       try {
         await reportProgress(20, 100, "Consultando cuestionarios en EVA...");
-        const cuestionarios = await _getCuestionarios(curso_id);
+        const cuestionarios = await _getCuestionarios(curso_id, forzar_refresco);
         await reportProgress(100, 100, "Cuestionarios obtenidos con éxito.");
         return {
-          content: [{ type: "text", text: wrapUntrustedContent(JSON.stringify(cuestionarios, null, 2), "eva_cuestionarios") }],
+          content: [{ type: "text", text: wrapUntrustedContent(JSON.stringify(cuestionarios), "eva_cuestionarios") }],
           structuredContent: { cuestionarios }
         };
       } catch (err) {
@@ -1001,7 +1070,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         const res = await _getCronogramaMateria(materia);
         await reportProgress(100, 100, res.encontrado ? "Cronograma procesado con éxito." : "Búsqueda finalizada.");
         return {
-          content: [{ type: "text", text: wrapUntrustedContent(JSON.stringify(res, null, 2), "eva_cronograma") }],
+          content: [{ type: "text", text: wrapUntrustedContent(JSON.stringify(res), "eva_cronograma") }],
           structuredContent: res as unknown as Record<string, unknown>
         };
       } catch (err) {
@@ -1018,7 +1087,7 @@ export function createServer(services: ServerServices = {}): McpServer {
       description: "Consulta qué tareas, trabajos prácticos o actividades tienen fecha de vencimiento en los próximos días (por defecto 7 días / la semana que viene) y avisos recientes de cátedra.",
       inputSchema: {
         dias: z.number().int().min(1).max(30).optional().default(7).describe("Cantidad de días a futuro (por defecto 7 para la próxima semana)"),
-        curso_id: z.number().int().positive().optional().describe("ID de curso en EVA opcional")
+        curso_id: z.number().int().min(1).optional().describe("ID de curso en EVA opcional")
       },
       outputSchema: {
         totalPendientes: z.number(),
@@ -1035,7 +1104,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         const res = await _getEntregasProximas(dias, curso_id);
         await reportProgress(100, 100, "Entregas obtenidas.");
         return {
-          content: [{ type: "text", text: wrapUntrustedContent(JSON.stringify(res, null, 2), "eva_entregas_proximas") }],
+          content: [{ type: "text", text: wrapUntrustedContent(JSON.stringify(res), "eva_entregas_proximas") }],
           structuredContent: res as unknown as Record<string, unknown>
         };
       } catch (err) {
@@ -1049,7 +1118,7 @@ export function createServer(services: ServerServices = {}): McpServer {
     "uca_resumen_semanal",
     {
       title: "Resumen Semanal del Alumno",
-      description: "Tool Compuesta: Trae en paralelo agenda, tareas próximas de EVA, avisos de cátedra e inasistencias/cursada de Guaraní.",
+      description: "Tool Compuesta: Trae en paralelo tareas próximas de EVA, avisos de cátedra, cursada/inasistencias, clases de hoy e inscripciones a finales de Guaraní.",
       inputSchema: {
         carrera: z.string().min(1).max(100).optional().describe("Nombre o código de la carrera (opcional)")
       },
@@ -1059,6 +1128,8 @@ export function createServer(services: ServerServices = {}): McpServer {
         tareasProximas: z.array(z.any()),
         avisosRecientes: z.array(z.any()),
         estadoCursada: z.array(z.any()),
+        clasesHoy: z.array(z.any()).optional(),
+        examenesInscriptos: z.array(z.any()).optional(),
         novedades: z.any().optional()
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true }
@@ -1069,6 +1140,12 @@ export function createServer(services: ServerServices = {}): McpServer {
       try {
         const resumen = await _getResumenSemanal(carrera);
         await reportProgress(100, 100, "Resumen semanal generado.");
+        if (resumen.sesionExpirada) {
+          return {
+            content: [{ type: "text" as const, text: "Error: la sesión de la UCA expiró y no se pudo consultar ninguna fuente. Ejecutá 'uca_iniciar_sesion' (o 'uca-mcp login') y reintentá." }],
+            isError: true
+          };
+        }
         return {
           content: [
             {
@@ -1131,23 +1208,24 @@ export function createServer(services: ServerServices = {}): McpServer {
       description: "Consulta el horario semanal de clases estructurado con día, horario de inicio y fin, aula y comisión desde SIU Guaraní. Soporta filtro para el día de hoy ('¿qué tengo hoy?').",
       inputSchema: {
         carrera: z.string().optional().describe("Nombre o código de la carrera"),
-        dia: z.string().optional().describe("Filtro opcional por día (ej: 'hoy', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'). Si se omite, devuelve toda la semana.")
+        dia: z.string().optional().describe("Filtro opcional por día (ej: 'hoy', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'). Si se omite, devuelve toda la semana."),
+        forzar_refresco: z.boolean().optional().default(false).describe("Si es true, ignora la caché de 45-60 s y consulta de nuevo")
       },
       outputSchema: {
         carrera: z.string().optional(),
         totalClasesSemana: z.number(),
         diaFiltrado: z.string().optional(),
         clases: z.array(z.any()),
-        agendaPorDia: z.record(z.array(z.any())),
+        agendaPorDia: z.record(z.string(), z.array(z.any())),
         mensaje: z.string()
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
     },
-    async ({ carrera, dia }, extra) => {
+    async ({ carrera, dia, forzar_refresco }, extra) => {
       const reportProgress = createProgressReporter(extra);
       await reportProgress(20, 100, "Consultando horario de clases en Guaraní...");
       try {
-        const horario = await _getHorarioSemanal(carrera, dia);
+        const horario = await _getHorarioSemanal(carrera, dia, forzar_refresco);
         await reportProgress(100, 100, "Horario obtenido.");
         return {
           content: [
@@ -1160,6 +1238,32 @@ export function createServer(services: ServerServices = {}): McpServer {
         };
       } catch (err) {
         return formatError("Error al consultar horario semanal", err);
+      }
+    }
+  );
+
+  // Tool 10c: guarani_cronograma_evaluaciones
+  server.registerTool(
+    "guarani_cronograma_evaluaciones",
+    {
+      title: "Cronograma de Evaluaciones en Guaraní",
+      description: "Fechas oficiales de parciales, recuperatorios y otras evaluaciones de tus cursadas actuales (SIU Guaraní), con hora y comisión. Por defecto solo las próximas.",
+      inputSchema: {
+        carrera: z.string().optional().describe("Nombre o código de la carrera"),
+        incluir_pasadas: z.boolean().optional().default(false).describe("Si es true, incluye también evaluaciones ya pasadas"),
+        forzar_refresco: z.boolean().optional().default(false).describe("Si es true, ignora la caché de 60 s y consulta de nuevo")
+      },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true }
+    },
+    async ({ carrera, incluir_pasadas, forzar_refresco }, extra) => {
+      const reportProgress = createProgressReporter(extra);
+      await reportProgress(20, 100, "Consultando cronograma de evaluaciones en Guaraní...");
+      try {
+        const res = await _getCronogramaEvaluaciones(carrera, !incluir_pasadas, forzar_refresco);
+        await reportProgress(100, 100, "Cronograma obtenido.");
+        return { content: [{ type: "text", text: JSON.stringify(res) }] };
+      } catch (err) {
+        return formatError("Error al consultar el cronograma de evaluaciones en Guaraní", err);
       }
     }
   );
@@ -1214,7 +1318,8 @@ export function createServer(services: ServerServices = {}): McpServer {
       description: "[EXPERIMENTAL] Mesas de examen final con fechas, turnos, tribunales y condición en SIU Guaraní. Parser experimental hasta contar con fixtures HTML anonimizados de turnos activos.",
       inputSchema: {
         carrera: z.string().min(1).max(100).describe("Nombre o código de la carrera"),
-        materia: z.string().min(1).max(100).describe("Nombre o código de la materia a consultar")
+        materia: z.string().min(1).max(100).describe("Nombre o código de la materia a consultar"),
+        forzar_refresco: z.boolean().optional().default(false).describe("Si es true, ignora la caché de 45-60 s y consulta de nuevo")
       },
       outputSchema: {
         carrera: z.string(),
@@ -1224,11 +1329,11 @@ export function createServer(services: ServerServices = {}): McpServer {
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
     },
-    async ({ carrera, materia }, extra) => {
+    async ({ carrera, materia, forzar_refresco }, extra) => {
       const reportProgress = createProgressReporter(extra);
       await reportProgress(20, 100, `Consultando turnos de examen para '${materia}'...`);
       try {
-        const mesas = await _getMesasDisponibles(carrera, materia);
+        const mesas = await _getMesasDisponibles(carrera, materia, forzar_refresco);
         await reportProgress(100, 100, "Mesas obtenidas.");
         return {
           content: [
@@ -1265,7 +1370,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         plan: z.string().optional(),
         version: z.string().optional(),
         materias: z.array(z.any()),
-        analisisMateria: z.record(z.any()).optional(),
+        analisisMateria: z.record(z.string(), z.any()).optional(),
         resumenImpacto: z.string().optional(),
         analisisCompleto: z.boolean().optional(),
         materiasSinVerificar: z.number().optional(),
@@ -1331,7 +1436,7 @@ export function createServer(services: ServerServices = {}): McpServer {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ materiasHabilitadas: materias, cantidad: materias.length, mensaje }, null, 2)
+              text: JSON.stringify({ materiasHabilitadas: materias, cantidad: materias.length, mensaje })
             }
           ],
           structuredContent: { materiasHabilitadas: materias, cantidad: materias.length, mensaje }
@@ -1361,7 +1466,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         regularizadas: z.number(),
         porcentajeAvance: z.number().optional(),
         materiasEnCurso: z.array(z.string()),
-        materiasRestantesPorAnio: z.record(z.array(z.string())),
+        materiasRestantesPorAnio: z.record(z.string(), z.array(z.string())),
         mensaje: z.string()
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
@@ -1373,7 +1478,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         const res = await _getProgresoCarrera(carrera);
         await reportProgress(100, 100, "Progreso de carrera calculado.");
         return {
-          content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(res) }],
           structuredContent: res as unknown as Record<string, unknown>
         };
       } catch (err) {
@@ -1431,7 +1536,8 @@ export function createServer(services: ServerServices = {}): McpServer {
       title: "Mis Inscripciones a Examen Final en Guaraní",
       description: "Consulta las inscripciones activas a mesas de examen final y actuaciones provisorias del alumno en SIU Guaraní.",
       inputSchema: {
-        carrera: z.string().optional().describe("Nombre o código de la carrera")
+        carrera: z.string().optional().describe("Nombre o código de la carrera"),
+        forzar_refresco: z.boolean().optional().default(false).describe("Si es true, ignora la caché de 45-60 s y consulta de nuevo")
       },
       outputSchema: {
         inscripciones: z.array(z.any()),
@@ -1439,14 +1545,14 @@ export function createServer(services: ServerServices = {}): McpServer {
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
     },
-    async ({ carrera }, extra) => {
+    async ({ carrera, forzar_refresco }, extra) => {
       const reportProgress = createProgressReporter(extra);
       try {
         await reportProgress(30, 100, "Consultando inscripciones a examen en Guaraní...");
-        const result = await _getMisInscripcionesExamen(carrera);
+        const result = await _getMisInscripcionesExamen(carrera, forzar_refresco);
         await reportProgress(100, 100, "Inscripciones obtenidas con éxito.");
         return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(result) }],
           structuredContent: result as unknown as Record<string, unknown>
         };
       } catch (err) {
@@ -1478,7 +1584,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         const result = await _getEncuestasPendientes(carrera);
         await reportProgress(100, 100, "Encuestas verificadas con éxito.");
         return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(result) }],
           structuredContent: result as unknown as Record<string, unknown>
         };
       } catch (err) {
@@ -1509,7 +1615,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         const solicitudes = await _getHistorialConstancias(carrera, descargar);
         await reportProgress(100, 100, "Historial de constancias obtenido con éxito.");
         return {
-          content: [{ type: "text", text: JSON.stringify(solicitudes, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify(solicitudes) }],
           structuredContent: { solicitudes }
         };
       } catch (err) {
@@ -1523,7 +1629,7 @@ export function createServer(services: ServerServices = {}): McpServer {
     "campus_aranceles_y_tramites",
     {
       title: "[EXPERIMENTAL] Aranceles y Trámites en Campus",
-      description: "[EXPERIMENTAL] Consulta aranceles al día/pendientes y estado de trámites administrativos en Campus Autogestión. Parser experimental sujeto a la estructura dinámica del portal.",
+      description: "[EXPERIMENTAL] Consulta aranceles al día/pendientes y estado de trámites administrativos en Campus Autogestión. Incluye saldo, habilitación para cursar/rendir y trámites en curso.",
       inputSchema: {
         consulta: z
           .enum(["todo", "aranceles", "tramites"])
@@ -1535,7 +1641,10 @@ export function createServer(services: ServerServices = {}): McpServer {
         aranceles: z.array(z.any()).optional(),
         tramites: z.array(z.any()).optional(),
         estadoAranceles: z.string().optional(),
-        errores: z.record(z.string()).optional()
+        saldo: z.string().optional(),
+        puedeCursar: z.boolean().optional(),
+        puedeRendir: z.boolean().optional(),
+        errores: z.record(z.string(), z.string()).optional()
       },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
     },
@@ -1569,7 +1678,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         title: "[EXPERIMENTAL] Guardar Borrador de Tarea en EVA",
         description: "[EXPERIMENTAL] Sube un archivo o texto a EVA Moodle en modo borrador editable. Requiere confirmación física en Canal B.",
         inputSchema: {
-          cmid: z.number().int().positive().describe("ID numérico de la tarea o módulo en EVA (cmid)"),
+          cmid: z.number().int().min(1).describe("ID numérico de la tarea o módulo en EVA (cmid)"),
           ruta_archivo: z.string().min(1).max(500).optional().describe("Ruta absoluta local del archivo a subir como borrador"),
           texto_en_linea: z.string().max(350).optional().describe("Texto en línea para el borrador de entrega (máx 350 caracteres)")
         },
@@ -1578,7 +1687,7 @@ export function createServer(services: ServerServices = {}): McpServer {
           aprobado: z.boolean().optional(),
           mensaje: z.string(),
           instruccion: z.string().optional(),
-          detalles: z.record(z.any()).optional()
+          detalles: z.record(z.string(), z.any()).optional()
         },
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
       },
@@ -1618,7 +1727,7 @@ export function createServer(services: ServerServices = {}): McpServer {
         title: "Responder en Foro de Cátedra en EVA",
         description: "Publica una respuesta en un foro de cátedra de EVA Moodle. Muestra el texto completo y requiere confirmación física en Canal B.",
         inputSchema: {
-          discusion_id: z.number().int().positive().describe("ID numérico del hilo o debate de foro"),
+          discusion_id: z.number().int().min(1).describe("ID numérico del hilo o debate de foro"),
           mensaje: z.string().min(1).max(350).describe("Mensaje exacto a publicar en el foro (máx 350 caracteres)")
         },
         outputSchema: {
@@ -1626,7 +1735,7 @@ export function createServer(services: ServerServices = {}): McpServer {
           aprobado: z.boolean().optional(),
           mensaje: z.string(),
           instruccion: z.string().optional(),
-          detalles: z.record(z.any()).optional()
+          detalles: z.record(z.string(), z.any()).optional()
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
       },
@@ -1679,7 +1788,7 @@ export function createServer(services: ServerServices = {}): McpServer {
             mensaje: z.string(),
             comprobante: z.string().optional(),
             instruccion: z.string().optional(),
-            detalles: z.record(z.any()).optional()
+            detalles: z.record(z.string(), z.any()).optional()
           },
           annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
         },
@@ -1741,7 +1850,7 @@ export function createServer(services: ServerServices = {}): McpServer {
           rutaArchivoPdf: z.string().optional(),
           comprobante: z.string().optional(),
           instruccion: z.string().optional(),
-          detalles: z.record(z.any()).optional()
+          detalles: z.record(z.string(), z.any()).optional()
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
       },
@@ -1898,5 +2007,51 @@ export function createServer(services: ServerServices = {}): McpServer {
     }
   );
 
+  installPortableToolsList(server);
   return server;
 }
+
+const UNSUPPORTED_SCHEMA_KEYS = new Set(["$schema", "additionalProperties", "propertyNames", "$id", "$comment"]);
+
+/** Reduce un JSON Schema a un subconjunto aceptado por Gemini, OpenAI y Cursor. */
+export function sanitizeJsonSchema(node: any): any {
+  if (Array.isArray(node)) return node.map(sanitizeJsonSchema);
+  if (!node || typeof node !== "object") return node;
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (UNSUPPORTED_SCHEMA_KEYS.has(k)) continue;
+    if (k === "exclusiveMinimum" && typeof v === "number") {
+      if (out.minimum === undefined) out.minimum = Number.isInteger(v) && node.type === "integer" ? v + 1 : v;
+      continue;
+    }
+    if (k === "exclusiveMaximum" && typeof v === "number") {
+      if (out.maximum === undefined) out.maximum = Number.isInteger(v) && node.type === "integer" ? v - 1 : v;
+      continue;
+    }
+    if (k === "const") { out.enum = [v]; continue; }
+    out[k] = sanitizeJsonSchema(v);
+  }
+  return out;
+}
+
+/** Envuelve el handler tools/list del SDK para sanear los esquemas; tolerante a cambios internos del SDK. */
+function installPortableToolsList(server: McpServer): void {
+  try {
+    const low: any = (server as any).server;
+    const original = low?._requestHandlers?.get?.("tools/list");
+    if (typeof original !== "function") return;
+    low._requestHandlers.set("tools/list", async (request: any, extra: any) => {
+      const res = await original(request, extra);
+      if (res && Array.isArray(res.tools)) {
+        res.tools = res.tools.map((t: any) => {
+          const { outputSchema: _o, ...rest } = t;
+          return { ...rest, inputSchema: sanitizeJsonSchema(t.inputSchema) };
+        });
+      }
+      return res;
+    });
+  } catch (err) {
+    logger.warn("No se pudo instalar el saneador de esquemas de tools/list");
+  }
+}
+

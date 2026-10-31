@@ -6,5 +6,6 @@ dist/
 *.tsbuildinfo
 .env
 .env.*
+.npmrc
 .DS_Store
 Thumbs.db

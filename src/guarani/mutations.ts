@@ -32,7 +32,12 @@ export function parseGuaraniInscripcionResponse(resText: string): {
 
   try {
     const json = JSON.parse(resText);
-    if (json.cod === "-1" || json.cod === -1 || json.error) {
+    if (json.cod === "-2" || json.cod === -2) {
+      errorMsg = "SIU Guaraní redirigió al inicio: la operación no está disponible en este momento o la solicitud no fue reconocida.";
+    } else if (json.ok === false || json.ok === "0" || json.ok === 0) {
+      const $okcont = cheerio.load(typeof json.cont === "string" ? json.cont : "");
+      errorMsg = $okcont(".alert-danger, .alert-error, .error, .mensaje-error").text().trim() || json.msg || json.mensaje || "SIU Guaraní rechazó la solicitud.";
+    } else if (json.cod === "-1" || json.cod === -1 || json.error) {
       errorMsg = json.msg || json.error || json.mensaje || "Error retornado por Guaraní al procesar la inscripción";
     } else if (json.comprobante || json.nro_transaccion) {
       comprobanteText = String(json.comprobante || json.nro_transaccion);
@@ -118,7 +123,7 @@ export async function inscribirExamen(
       await ensureCarreraActiva(carrera, true);
 
       // 1. Obtener catálogo y token anti-CSRF fresco
-      const pageRes = await guaraniFetch("/inscripcion_examen");
+      const pageRes = await guaraniFetch("/examen");
       const pageRaw = await readGuaraniText(pageRes);
       const pageHtml = unwrapChulupiHtml(pageRaw);
       const $ = cheerio.load(pageHtml);
@@ -179,7 +184,7 @@ export async function inscribirExamen(
         llamado: llamadoId
       });
 
-      const response = await guaraniFetch("/inscripcion_examen/inscribir", {
+      const response = await guaraniFetch("/examen/inscribir", {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded"
@@ -196,7 +201,7 @@ export async function inscribirExamen(
 
       // Si la respuesta no trajo comprobante explícito, releer la página para confirmar que la mesa figura inscripta
       if (!comprobanteText) {
-        const checkRes = await guaraniFetch("/inscripcion_examen");
+        const checkRes = await guaraniFetch("/examen");
         const checkRaw = await readGuaraniText(checkRes);
         const checkHtml = unwrapChulupiHtml(checkRaw);
         const $check = cheerio.load(checkHtml);
@@ -361,6 +366,12 @@ export async function solicitarCertificadoAlumnoRegular(
     forzarNueva = false
   } = params;
 
+  if (tipoConstancia === "examen_final" || tipoConstancia === "examen_parcial") {
+    throw new Error(
+      `La constancia '${tipoConstancia}' exige elegir un llamado o evaluación específico en el portal de SIU Guaraní (Solicitar Constancias y Certificados) y no se puede emitir desde esta herramienta. Solicitala manualmente en https://guarani.uca.edu.ar.`
+    );
+  }
+
   let constanciaInfo: { id: string; form: string; nombre: string } | undefined;
   const safeCopias = Math.max(1, Math.min(5, copias));
 
@@ -377,8 +388,6 @@ export async function solicitarCertificadoAlumnoRegular(
         const nom = o.nombre.toLowerCase();
         if (tipoConstancia === "alumno_regular") return nom.includes("alumno regular") || nom.includes("regular");
         if (tipoConstancia === "actividades_aprobadas") return nom.includes("actividades aprobadas") || nom.includes("aprobadas");
-        if (tipoConstancia === "examen_final") return nom.includes("examen final") || nom.includes("final");
-        if (tipoConstancia === "examen_parcial") return nom.includes("examen parcial") || nom.includes("parcial");
         if (tipoConstancia === "promedio_academico") return nom.includes("promedio");
         return false;
       });
@@ -436,6 +445,7 @@ export async function solicitarCertificadoAlumnoRegular(
       const esDestinatarioCompatible = (sPres?: string): boolean => {
         if (!targetPres || targetPres === "a quien corresponda") return true;
         const sNorm = normPres(sPres);
+        if (!sNorm) return false;
         return sNorm.includes(targetPres) || targetPres.includes(sNorm);
       };
 

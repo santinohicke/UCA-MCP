@@ -135,9 +135,12 @@ export function validateUploadFile(filePath: string): ValidateUploadResult {
       candidateRoots.push(...extraDirs);
     }
 
-    const allowedRoots = candidateRoots.map((r) => path.resolve(r).toLowerCase());
+    // Windows y macOS usan sistemas de archivos que no distinguen mayúsculas; en Linux sí
+    const caseInsensitiveFs = process.platform === "win32" || process.platform === "darwin";
+    const normPath = (p: string) => (caseInsensitiveFs ? p.toLowerCase() : p);
+    const allowedRoots = candidateRoots.map((r) => normPath(path.resolve(r)));
 
-    const realPathResolved = path.resolve(realPath).toLowerCase();
+    const realPathResolved = normPath(path.resolve(realPath));
     const isInsideAllowed = allowedRoots.some(
       (root) => realPathResolved === root || realPathResolved.startsWith(root + path.sep)
     );

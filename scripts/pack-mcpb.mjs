@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { execSync } from "node:child_process";
 import * as fflate from "fflate";
 
 const ROOT_DIR = process.cwd();
@@ -20,71 +19,51 @@ console.log(`[PACK] Empaquetando bundle MCPB: ${bundleName}...`);
 
 const zipEntries = {};
 
-// 1. Archivos raíz esenciales
-const rootFiles = ["manifest.json", "package.json", "README.md", "LICENSE", "tsconfig.json"];
-for (const file of rootFiles) {
+// 1. Archivos raíz esenciales (package.json mínimo: "type":"module" es necesario para ejecutar el bundle ESM)
+const rootPkg = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, "package.json"), "utf8"));
+const bundleEntry = path.join(BUILD_DIR, "src", "index.js");
+if (!fs.existsSync(bundleEntry)) {
+  console.error("[PACK] Falta build/src/index.js. Ejecutá 'npm run build' primero.");
+  process.exit(1);
+}
+const isBundled = !/from\s+["']\.\.?\//.test(fs.readFileSync(bundleEntry, "utf8"));
+if (!isBundled) {
+  console.error("[PACK] build/src/index.js no está empaquetado con esbuild (tiene imports relativos). Ejecutá 'npm run build'.");
+  process.exit(1);
+}
+zipEntries["package.json"] = Buffer.from(JSON.stringify({
+  name: rootPkg.name,
+  version: rootPkg.version,
+  type: "module",
+  license: rootPkg.license,
+  dependencies: { "playwright-core": rootPkg.dependencies["playwright-core"] }
+}, null, 2) + "\n");
+for (const file of ["manifest.json", "README.md", "LICENSE"]) {
   const filePath = path.join(ROOT_DIR, file);
-  if (fs.existsSync(filePath)) {
-    zipEntries[file] = fs.readFileSync(filePath);
-    console.log(`  + ${file}`);
-  }
+  if (fs.existsSync(filePath)) zipEntries[file] = fs.readFileSync(filePath);
 }
 
-// 2. Archivos compilados en build/ y código fuente auditable
-function addDirRecursive(dir, prefix = "") {
+// 2. Solo el bundle único y pdfjs vendorizado (el resto de build/, src/, scripts/ no se necesita en runtime)
+function addDirRecursive(dir, prefix = "", skip = () => false) {
   if (!fs.existsSync(dir)) return;
-  const items = fs.readdirSync(dir, { withFileTypes: true });
-  for (const item of items) {
-    // Excluir archivos y carpetas de test del paquete de distribución
-    if (prefix === "build" && item.name === "test") continue;
-
+  for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
     const fullPath = path.join(dir, item.name);
-    const relPath = path.join(prefix, item.name).replace(/\\/g, "/");
-    if (item.isDirectory()) {
-      addDirRecursive(fullPath, relPath);
-    } else {
-      zipEntries[relPath] = fs.readFileSync(fullPath);
-      console.log(`  + ${relPath}`);
-    }
+    const relPath = path.posix.join(prefix, item.name);
+    if (skip(relPath, item)) continue;
+    if (item.isDirectory()) addDirRecursive(fullPath, relPath, skip);
+    else zipEntries[relPath] = fs.readFileSync(fullPath);
   }
 }
-
-addDirRecursive(BUILD_DIR, "build");
+zipEntries["build/src/index.js"] = fs.readFileSync(bundleEntry);
 addDirRecursive(path.join(ROOT_DIR, "vendor"), "vendor");
-addDirRecursive(path.join(ROOT_DIR, "src"), "src");
-addDirRecursive(path.join(ROOT_DIR, "scripts"), "scripts");
-addDirRecursive(path.join(ROOT_DIR, "bin"), "bin");
 
-// 3. Dependencias de producción en node_modules
-console.log("[PACK] Empaquetando dependencias de producción (node_modules)...");
-try {
-  const prodOutput = execSync("npm ls --omit=dev --parseable --all", { encoding: "utf8" });
-  const prodDirs = prodOutput.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(1);
-  const addedDirs = new Set();
-
-  for (const pkgDir of prodDirs) {
-    if (!fs.existsSync(pkgDir) || addedDirs.has(pkgDir)) continue;
-    addedDirs.add(pkgDir);
-
-    function scanPkg(dir) {
-      const items = fs.readdirSync(dir, { withFileTypes: true });
-      for (const item of items) {
-        if (item.isDirectory()) {
-          if (item.name === "test" || item.name === "tests" || item.name === ".github" || item.name === ".bin") continue;
-          scanPkg(path.join(dir, item.name));
-        } else {
-          if (item.name.endsWith(".map") || item.name.endsWith(".tsbuildinfo")) continue;
-          const full = path.join(dir, item.name);
-          const rel = path.relative(ROOT_DIR, full).replace(/\\/g, "/");
-          zipEntries[rel] = fs.readFileSync(full);
-        }
-      }
-    }
-    scanPkg(pkgDir);
-  }
-} catch (err) {
-  console.warn(`[WARN] No se pudieron listar dependencias con npm ls: ${err.message}`);
-}
+// 3. node_modules mínimo: solo playwright-core (sin dependencias propias), sin tipos ni documentación
+addDirRecursive(path.join(ROOT_DIR, "node_modules", "playwright-core"), "node_modules/playwright-core", (rel, item) =>
+  item.isDirectory()
+    ? item.name === "types" || item.name === "test" || item.name === "tests"
+    : /\.(map|md|d\.ts)$/.test(item.name) || item.name === "ThirdPartyNotices.txt"
+);
+console.log(`[PACK] ${Object.keys(zipEntries).length} archivos`);
 
 // 4. Comprimir a formato .mcpb (ZIP estándar) con compresión nivel 6 balanceada
 const zipped = fflate.zipSync(zipEntries, { level: 6 });

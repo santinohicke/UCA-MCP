@@ -2,7 +2,7 @@
   "manifest_version": "0.1",
   "name": "uca-mcp",
   "display_name": "UCA MCP - Asistente Académico",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Conectá EVA Moodle, SIU Guaraní y Campus Autogestión con Claude sin usar la terminal.",
   "author": {
     "name": "Comunidad Estudiantil UCA"
@@ -21,8 +21,8 @@
   "user_config": {
     "habilitar_escritura": {
       "type": "boolean",
-      "title": "Habilitar acciones de escritura en EVA (entregas y foros protegidos por Canal B)",
-      "description": "Permite activar las herramientas de mutación para subir entregas de tareas y responder en foros tras confirmación física.",
+      "title": "Habilitar acciones de escritura en EVA y Guaraní (entregas, foros, certificados y finales)",
+      "description": "Permite activar las herramientas de mutación para subir entregas de tareas, responder en foros, inscribir a finales y solicitar certificados tras confirmación física.",
       "default": true
     }
   },
@@ -50,7 +50,7 @@
     },
     {
       "name": "uca_resumen_semanal",
-      "description": "Trae en paralelo agenda, tareas próximas de EVA, avisos de cátedra e inasistencias de Guaraní."
+      "description": "Trae en paralelo tareas próximas de EVA, avisos de cátedra, cursada e inasistencias, clases de hoy e inscripciones a finales de Guaraní."
     },
     {
       "name": "eva_materias",
@@ -119,6 +119,10 @@
     {
       "name": "guarani_horario_semanal",
       "description": "Consulta el horario semanal de clases estructurado con días, horarios, aulas y comisiones (admite filtro 'hoy')."
+    },
+    {
+      "name": "guarani_cronograma_evaluaciones",
+      "description": "Fechas oficiales de parciales, recuperatorios y otras evaluaciones de tus cursadas actuales en SIU Guaraní."
     },
     {
       "name": "guarani_historia_academica",

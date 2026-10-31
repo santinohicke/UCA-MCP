@@ -20,13 +20,18 @@ if (typeof (Promise as any).withResolvers !== "function") {
 const require = createRequire(import.meta.url);
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
-// Resuelve la carpeta vendor tanto desde build/src/shared/documents (4 niveles) como desde src/shared/documents (3 niveles)
+// Resuelve la carpeta vendor ascendiendo desde el archivo actual
 function findVendorDir(): string {
-  const candidate1 = path.resolve(currentDir, "../../../../vendor/pdfjs");
-  if (fs.existsSync(candidate1)) return candidate1;
-  const candidate2 = path.resolve(currentDir, "../../../vendor/pdfjs");
-  if (fs.existsSync(candidate2)) return candidate2;
-  return candidate1;
+  // Sube desde el directorio actual hasta hallar vendor/pdfjs (funciona en src/, build/ y en el bundle único)
+  let dir = currentDir;
+  for (let i = 0; i < 6; i++) {
+    const candidate = path.join(dir, "vendor", "pdfjs");
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.resolve(currentDir, "../../../../vendor/pdfjs");
 }
 
 const vendorDir = findVendorDir();

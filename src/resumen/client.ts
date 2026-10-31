@@ -1,8 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "../config.js";
+import { SessionExpiredError } from "../shared/http.js";
+import { getArancelesYTramites } from "../campus/client.js";
 import { getTareasYNotas, getForos, type TareaInfo, type ForoItem } from "../eva/client.js";
-import { getEstadoCursada, type CursadaInfo } from "../guarani/client.js";
+import {
+  getEstadoCursada,
+  getHorarioSemanal,
+  getMisInscripcionesExamen,
+  type CursadaInfo,
+  type ClaseHorario,
+  type MesaExamenInfo
+} from "../guarani/client.js";
 
 export interface ResumenSnapshotData {
   timestamp: number;
@@ -20,19 +29,41 @@ export interface ResumenSemanalInfo {
   tareasProximas: TareaInfo[];
   avisosRecientes: ForoItem[];
   estadoCursada: CursadaInfo[];
+  clasesHoy?: ClaseHorario[];
+  examenesInscriptos?: MesaExamenInfo[];
+  puedeCursar?: boolean;
+  puedeRendir?: boolean;
+  sesionExpirada?: boolean;
   alertas: string[];
   novedades?: ResumenNovedades;
+}
+
+// Limita el tiempo de espera de datos complementarios para que nunca demoren el resumen principal
+function conTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("tiempo de espera agotado")), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
 }
 
 // Genera un resumen semanal consolidado consultando EVA y SIU Guaraní en paralelo
 export async function getResumenSemanal(carrera?: string): Promise<ResumenSemanalInfo> {
   const alertas: string[] = [];
 
-  const [tareasRes, forosRes, cursadaRes] = await Promise.allSettled([
+  const [tareasRes, forosRes, cursadaRes, hoyRes, examenesRes, campusRes] = await Promise.allSettled([
     getTareasYNotas(undefined, false),
-    getForos(undefined, 5),
-    getEstadoCursada(carrera)
+    conTimeout(getForos(undefined, 10).then((f) => f.slice(0, 5)), 10000),
+    getEstadoCursada(carrera),
+    conTimeout(getHorarioSemanal(carrera, "hoy"), 8000),
+    conTimeout(getMisInscripcionesExamen(carrera), 8000),
+    conTimeout(getArancelesYTramites("aranceles"), 6000)
   ]);
+
+  const principales = [tareasRes, forosRes, cursadaRes];
+  const sesionExpirada =
+    principales.every((r) => r.status === "rejected") &&
+    principales.some((r) => r.status === "rejected" && r.reason instanceof SessionExpiredError);
 
   const tareasProximas = tareasRes.status === "fulfilled" ? tareasRes.value : [];
   if (tareasRes.status === "rejected") {
@@ -43,13 +74,29 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
   const avisosRecientes = forosRes.status === "fulfilled" ? forosRes.value : [];
   if (forosRes.status === "rejected") {
     const err = forosRes.reason instanceof Error ? forosRes.reason.message : String(forosRes.reason);
-    alertas.push(`⚠️ Error al sincronizar avisos de foros de EVA: ${err}`);
+    alertas.push(`⚠️ No se pudieron cargar los avisos de foros de EVA a tiempo (${err}); reintentá en unos segundos.`);
   }
 
   const estadoCursada = cursadaRes.status === "fulfilled" ? cursadaRes.value : [];
   if (cursadaRes.status === "rejected") {
     const err = cursadaRes.reason instanceof Error ? cursadaRes.reason.message : String(cursadaRes.reason);
     alertas.push(`⚠️ Error al sincronizar cursada e inasistencias de SIU Guaraní: ${err}`);
+  }
+
+  // Datos complementarios (best-effort): si fallan o demoran no se reportan como error
+  const clasesHoy = hoyRes.status === "fulfilled" ? hoyRes.value.clases : undefined;
+  const examenesInscriptos =
+    examenesRes.status === "fulfilled" && examenesRes.value.inscripciones.length > 0
+      ? examenesRes.value.inscripciones
+      : undefined;
+  if (examenesInscriptos) {
+    alertas.push(`Tenés ${examenesInscriptos.length} inscripción(es) activa(s) a examen final.`);
+  }
+
+  const puedeCursar = campusRes.status === "fulfilled" ? campusRes.value.puedeCursar : undefined;
+  const puedeRendir = campusRes.status === "fulfilled" ? campusRes.value.puedeRendir : undefined;
+  if (puedeCursar === false || puedeRendir === false) {
+    alertas.push("Tu situación administrativa (aranceles) te inhabilita para " + [puedeCursar === false ? "cursar" : "", puedeRendir === false ? "rendir" : ""].filter(Boolean).join(" y ") + ".");
   }
 
   alertas.push(...generarAlertasTareas(tareasProximas));
@@ -111,6 +158,11 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
       tareasProximas: compactTareas,
       avisosRecientes,
       estadoCursada: compactCursada,
+      clasesHoy,
+      examenesInscriptos,
+      puedeCursar,
+      puedeRendir,
+      sesionExpirada: sesionExpirada || undefined,
       alertas,
       novedades
     })

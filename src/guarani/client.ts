@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { ttlCached } from "../shared/ttl-cache.js";
 import path from "node:path";
 import * as cheerio from "cheerio";
 import { guaraniFetch, guaraniMutex } from "../shared/http.js";
@@ -349,9 +350,14 @@ export function parseReporteInasistencias(html: string): InasistenciasMateriaPar
 export function parseCalendarioAsignaciones(rawText: string): CursadaInfo[] {
   let asignaciones: any[] = [];
   try {
-    const j = JSON.parse(rawText);
-    const cont = typeof j?.cont === "string" ? j.cont : rawText;
-    const match = cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/);
+    let cont = rawText;
+    try {
+      const j = JSON.parse(rawText);
+      if (typeof j?.cont === "string") cont = j.cont;
+    } catch {}
+    const match =
+      cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);\s*<\/script>/) ||
+      cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/);
     if (match) {
       const data = JSON.parse(match[1]);
       if (Array.isArray(data?.info?.asignaciones)) {
@@ -767,12 +773,8 @@ export async function ensureCarreraActiva(
     const targetId = match ? match.id : targetCarrera;
     const targetNombre = match ? match.nombre : targetCarrera;
 
-    // Si ya está activa en la sesión, saltear conmutación y verificación para ahorrar 2 requests (salvo forceStrict)
-    if (!forceStrict && session?.carreraActiva === targetNombre) {
-      carreraActivaVerificada = { nombre: targetNombre, checkedAt: Date.now() };
-      return { activa: targetNombre, disponibles: disponibles.map((c) => c.nombre) };
-    }
-
+    // session.carreraActiva persiste entre procesos pero la carrera activa real vive en el servidor
+    // (cada login nuevo arranca en Bachillerato/ingreso), así que solo se confía en la verificación en memoria.
     const changeRes = await guaraniFetch(`/acceso/cambiar_carrera?id=${encodeURIComponent(targetId)}&op=inicio_alumno`);
     if (!changeRes.ok) {
       throw new Error(`Error al conmutar a la carrera '${targetNombre}' en Guaraní (HTTP ${changeRes.status}).`);
@@ -832,10 +834,6 @@ export async function ensureCarreraActiva(
   // 2. Si solo hay 1 carrera de grado/posgrado disponible, conmutar automáticamente para asegurar contexto en Guaraní
   if (disponibles.length === 1) {
     const unica = disponibles[0];
-    if (!forceStrict && session?.carreraActiva === unica.nombre) {
-      carreraActivaVerificada = { nombre: unica.nombre, checkedAt: Date.now() };
-      return { activa: unica.nombre, disponibles: [unica.nombre] };
-    }
     try {
       await guaraniFetch(`/acceso/cambiar_carrera?id=${encodeURIComponent(unica.id)}&op=inicio_alumno`);
       const s = loadEncryptedSession();
@@ -859,6 +857,12 @@ export async function ensureCarreraActiva(
     const checkHtml = await readGuaraniText(checkRes);
     realActiva = extractActiveCareerFromHtml(checkHtml);
   } catch {}
+
+  // Sin carrera de grado activa en el servidor (p. ej. Bachillerato/ingreso/tutoría): conmutar a la última usada o a la primera
+  if (!realActiva && disponibles.length > 0) {
+    const previa = disponibles.find((c) => c.nombre === session?.carreraActiva);
+    return ensureCarreraActiva((previa ?? disponibles[0]).nombre, forceStrict);
+  }
 
   const activa = realActiva || session?.carreraActiva || disponibles[0]?.nombre;
   if (realActiva) {
@@ -1085,11 +1089,15 @@ export async function getHistoriaAcademica(carrera?: string, forzarRefresco = fa
 }
 
 // 3. Obtener mesas de examen final disponibles para una materia
-export async function getMesasDisponibles(carrera: string, materia: string): Promise<MesaExamenInfo[]> {
+export async function getMesasDisponibles(carrera: string, materia: string, forzarRefresco = false): Promise<MesaExamenInfo[]> {
+  return ttlCached(`mesas:${carrera}:${materia}`, 45_000, forzarRefresco, () => getMesasSinCache(carrera, materia));
+}
+
+async function getMesasSinCache(carrera: string, materia: string): Promise<MesaExamenInfo[]> {
   return withGuaraniLock(async () => {
     try {
       await ensureCarreraActiva(carrera);
-      const res = await guaraniFetch(`/inscripcion_examen`);
+      const res = await guaraniFetch(`/examen`);
       const rawText = await readGuaraniText(res);
       return parseMesasExamen(unwrapChulupiHtml(rawText), materia);
     } catch (err) {
@@ -1415,10 +1423,32 @@ export async function prefetchPlanGraph(carrera?: string): Promise<void> {
   }
 }
 
+const ESTADOS_APROBADOS = new Set(["Aprobada", "Promocionada"]);
+const ESTADOS_REGULARIZADOS = new Set(["Regularizada", "Aprobada", "Promocionada"]);
+
+// Evalúa un requisito de correlatividad: materia puntual o módulo ("Módulo: 1° Año" = todo ese año aprobado)
+export function evaluarRequisito(
+  req: CorrelativaRequisito,
+  materias: MateriaPlan[]
+): { estadoActual: MateriaPlan["estado"]; cumple: boolean } {
+  const modulo = /^m[oó]dulo:\s*(\d+)/i.exec(req.materia.trim());
+  if (modulo && !req.codigo) {
+    const anio = Number(modulo[1]);
+    const delAnio = materias.filter((m) => m.anio === anio);
+    const cumple = delAnio.length > 0 && delAnio.every((m) => ESTADOS_APROBADOS.has(m.estado));
+    return { estadoActual: cumple ? "Aprobada" : "Pendiente", cumple };
+  }
+  const reqMat = materias.find((p) => matchMateria(req.codigo, req.materia, p.codigo, p.nombre));
+  if (!reqMat) return { estadoActual: "Pendiente", cumple: false };
+  const ok = req.condicionRequerida === "Regularizada" ? ESTADOS_REGULARIZADOS : ESTADOS_APROBADOS;
+  return { estadoActual: reqMat.estado, cumple: ok.has(reqMat.estado) };
+}
+
 // 4. Obtener plan de estudio interactivo y análisis de correlatividades / impacto
 export async function getPlanEstudio(
   carrera?: string,
-  targetMateria?: string
+  targetMateria?: string,
+  omitirGrafo = false
 ): Promise<PlanEstudiosInfo> {
   const planInfo = await withGuaraniLock(async () => {
     try {
@@ -1468,6 +1498,10 @@ export async function getPlanEstudio(
     }
   });
 
+  if (omitirGrafo) {
+    return planInfo;
+  }
+
   const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
 
   let mat: MateriaPlan | undefined;
@@ -1490,7 +1524,17 @@ export async function getPlanEstudio(
   const job = startGraphJob(planInfo, cachePath, priorityIds, targetAnio);
 
   // Esperar hasta 3.5s por el pool de correlativas para no bloquear la respuesta en clientes MCP
-  await Promise.race([job.promise, new Promise((resolve) => setTimeout(resolve, 3500))]);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      job.promise,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, 3500);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 
   const graph = getGraph(cachePath);
 
@@ -1506,16 +1550,7 @@ export async function getPlanEstudio(
     if (!corr.paraCursar || corr.paraCursar.length === 0) {
       return true;
     }
-    return corr.paraCursar.every((req) => {
-      const reqMat = planInfo.materias.find((p) =>
-        matchMateria(req.codigo, req.materia, p.codigo, p.nombre)
-      );
-      if (!reqMat) return false;
-      if (req.condicionRequerida === "Regularizada") {
-        return reqMat.estado === "Regularizada" || reqMat.estado === "Aprobada" || reqMat.estado === "Promocionada";
-      }
-      return reqMat.estado === "Aprobada" || reqMat.estado === "Promocionada";
-    });
+    return corr.paraCursar.every((req) => evaluarRequisito(req, planInfo.materias).cumple);
   });
 
   if (!targetMateria || !mat) {
@@ -1531,26 +1566,15 @@ export async function getPlanEstudio(
   if (mat.elementoId && graph[mat.elementoId]) {
     const { paraCursar, paraAprobar } = graph[mat.elementoId];
 
-    mat.correlativasParaCursar = paraCursar.map((req) => {
-      const reqMat = planInfo.materias.find((m) =>
-        matchMateria(req.codigo, req.materia, m.codigo, m.nombre)
-      );
-      const estadoActual = reqMat ? reqMat.estado : "Pendiente";
-      const cumple =
-        req.condicionRequerida === "Regularizada"
-          ? estadoActual === "Regularizada" || estadoActual === "Aprobada" || estadoActual === "Promocionada"
-          : estadoActual === "Aprobada" || estadoActual === "Promocionada";
-      return { ...req, estadoActual, cumple };
-    });
+    mat.correlativasParaCursar = paraCursar.map((req) => ({
+      ...req,
+      ...evaluarRequisito(req, planInfo.materias)
+    }));
 
-    mat.correlativasParaAprobar = paraAprobar.map((req) => {
-      const reqMat = planInfo.materias.find((m) =>
-        matchMateria(req.codigo, req.materia, m.codigo, m.nombre)
-      );
-      const estadoActual = reqMat ? reqMat.estado : "Pendiente";
-      const cumple = estadoActual === "Aprobada" || estadoActual === "Promocionada";
-      return { ...req, estadoActual, cumple };
-    });
+    mat.correlativasParaAprobar = paraAprobar.map((req) => ({
+      ...req,
+      ...evaluarRequisito({ ...req, condicionRequerida: "Aprobada" }, planInfo.materias)
+    }));
   } else {
     mat.correlativasParaCursar = [];
     mat.correlativasParaAprobar = [];
@@ -1667,7 +1691,11 @@ export interface MisInscripcionesResult {
 }
 
 // 5. Consultar inscripciones activas a mesas de examen final (en /actuacion_provisoria o /inscripcion_examen)
-export async function getMisInscripcionesExamen(carrera?: string): Promise<MisInscripcionesResult> {
+export async function getMisInscripcionesExamen(carrera?: string, forzarRefresco = false): Promise<MisInscripcionesResult> {
+  return ttlCached(`inscr:${carrera ?? ""}`, 45_000, forzarRefresco, () => getMisInscripcionesSinCache(carrera));
+}
+
+async function getMisInscripcionesSinCache(carrera?: string): Promise<MisInscripcionesResult> {
   return withGuaraniLock(async () => {
     await ensureCarreraActiva(carrera);
 
@@ -1802,7 +1830,7 @@ export interface ProgresoCarreraInfo {
 
 // 7. Calcular cuántas materias faltan para recibirse y el desglose de avance de carrera en SIU Guaraní
 export async function getProgresoCarrera(carrera?: string): Promise<ProgresoCarreraInfo> {
-  const planInfo = await getPlanEstudio(carrera);
+  const planInfo = await getPlanEstudio(carrera, undefined, true);
   const totalMaterias = planInfo.materias.length;
 
   const aprobadasList = planInfo.materias.filter((m) => m.estado === "Aprobada" || m.estado === "Promocionada");
@@ -1924,7 +1952,11 @@ export function parseHorarioSemanal(rawText: string): ClaseHorario[] {
 }
 
 // 8. Consultar horario semanal estructurado y clases del día ("¿Qué tengo hoy?")
-export async function getHorarioSemanal(carrera?: string, diaFiltro?: string): Promise<HorarioSemanalInfo> {
+export async function getHorarioSemanal(carrera?: string, diaFiltro?: string, forzarRefresco = false): Promise<HorarioSemanalInfo> {
+  return ttlCached(`horario:${carrera ?? ""}:${diaFiltro ?? ""}:${new Date().toDateString()}`, 45_000, forzarRefresco, () => getHorarioSemanalSinCache(carrera, diaFiltro));
+}
+
+async function getHorarioSemanalSinCache(carrera?: string, diaFiltro?: string): Promise<HorarioSemanalInfo> {
   return withGuaraniLock(async () => {
     const { activa } = await ensureCarreraActiva(carrera);
   const calRes = await guaraniFetch("/calendario");
@@ -2143,4 +2175,94 @@ export async function getPlanOptimo(carrera?: string, maxMateriasSugeridas = 5):
     sugerenciaProximoCuatrimestre: sugeridas,
     mensaje
   };
+}
+
+
+export interface EvaluacionCronograma {
+  materia: string;
+  codigo?: string;
+  comision?: string;
+  fecha: string;
+  evaluacion: string;
+  tipo: string;
+  horaInicio?: string;
+  horaFin?: string;
+  observaciones?: string;
+}
+
+// Parser puro de la operación "Cronograma de evaluaciones" (/cronograma_evaluaciones)
+export function parseCronogramaEvaluaciones(html: string): { carrera?: string; evaluaciones: EvaluacionCronograma[] } {
+  const $ = cheerio.load(html);
+  const carrera = $("h1").first().text().replace(/\s+/g, " ").trim() || undefined;
+  const evaluaciones: EvaluacionCronograma[] = [];
+  $("h2").each((_, h2) => {
+    const titulo = $(h2).text().replace(/\s+/g, " ").trim();
+    const m = /^(.*?)\s*\(([A-Z0-9]+)\)\s*-\s*Comisi[oó]n:\s*(.*)$/i.exec(titulo);
+    const table = $(h2).nextAll("table").first();
+    if (!m || table.length === 0) return;
+    table.find("tbody tr").each((__, tr) => {
+      const c = $(tr).find("td").map((___, td) => $(td).text().replace(/\s+/g, " ").trim()).get();
+      if (c.length < 3 || !/\d{1,2}\/\d{1,2}\/\d{4}/.test(c[0])) return;
+      evaluaciones.push({
+        materia: m[1].trim(),
+        codigo: m[2],
+        comision: m[3].trim(),
+        fecha: c[0],
+        evaluacion: c[1],
+        tipo: c[2],
+        horaInicio: c[3] || undefined,
+        horaFin: c[4] || undefined,
+        observaciones: c[5] && c[5] !== c[1] ? c[5] : undefined
+      });
+    });
+  });
+  const ts = (f: string) => {
+    const [d, mo, y] = f.split("/").map(Number);
+    return new Date(y, mo - 1, d).getTime();
+  };
+  evaluaciones.sort((a, b) => ts(a.fecha) - ts(b.fecha));
+  return { carrera, evaluaciones };
+}
+
+export interface CronogramaEvaluacionesResult {
+  carrera?: string;
+  total: number;
+  evaluaciones: EvaluacionCronograma[];
+  mensaje: string;
+}
+
+// Fechas de parciales, recuperatorios y demás evaluaciones de las cursadas actuales (fuente oficial: SIU Guaraní)
+export async function getCronogramaEvaluaciones(
+  carrera?: string,
+  soloProximas = true,
+  forzarRefresco = false
+): Promise<CronogramaEvaluacionesResult> {
+  return ttlCached(`cronograma:${carrera ?? ""}`, 60_000, forzarRefresco, () =>
+    withGuaraniLock(async () => {
+      await ensureCarreraActiva(carrera);
+      const res = await guaraniFetch("/cronograma_evaluaciones");
+      const parsed = parseCronogramaEvaluaciones(unwrapChulupiHtml(await readGuaraniText(res)));
+      return parsed;
+    })
+  ).then((parsed) => {
+    const hoy = new Date();
+    hoy.setHours(0, 0, 0, 0);
+    const lista = soloProximas
+      ? parsed.evaluaciones.filter((e) => {
+          const [d, mo, y] = e.fecha.split("/").map(Number);
+          return new Date(y, mo - 1, d).getTime() >= hoy.getTime();
+        })
+      : parsed.evaluaciones;
+    return {
+      carrera: parsed.carrera,
+      total: lista.length,
+      evaluaciones: lista,
+      mensaje:
+        lista.length > 0
+          ? `Tenés ${lista.length} evaluación(es) ${soloProximas ? "próxima(s)" : "cargada(s)"} en el cronograma oficial de SIU Guaraní.`
+          : soloProximas
+            ? "No hay evaluaciones próximas cargadas en el cronograma de SIU Guaraní (puede que las cátedras aún no las hayan publicado; probá eva_cronograma)."
+            : "No hay evaluaciones cargadas en el cronograma de SIU Guaraní."
+    };
+  });
 }

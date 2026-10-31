@@ -2,7 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import * as cheerio from "cheerio";
-import { evaFetch, evaAjaxRpc } from "../shared/http.js";
+import { evaFetch } from "../shared/http.js";
 import { showNativeConfirmation, validateUploadFile, pickNativeFile, sanitizeDialogText } from "../shared/native-confirm.js";
 import { clearEvaCache } from "./client.js";
 import { logger } from "../shared/logger.js";
@@ -113,11 +113,9 @@ export function extractForumReplyContext(
   }
 
   const parentPostId = parseInt(matchPostId[1], 10);
-  const matchSubject =
-    discHtml.match(/data-reply-subject="([^"]+)"/i) ||
+  const rawSubject =
+    $disc("[data-reply-subject]").first().attr("data-reply-subject")?.trim() ||
     $disc(".discussionname, h3, h2").first().text().trim();
-
-  const rawSubject = typeof matchSubject === "string" ? matchSubject.trim() : matchSubject?.[1]?.trim();
   const baseSubject = rawSubject || `Discusión ${discusionId ? `#${discusionId}` : ""}`;
   const replySubject = baseSubject.toLowerCase().startsWith("re:") ? baseSubject : `Re: ${baseSubject}`;
 
@@ -130,6 +128,15 @@ export function extractForumReplyContext(
     "Cátedra";
 
   return { parentPostId, replySubject, nombreForo, autorOriginal };
+}
+
+// Devuelve true solo si la página de la tarea muestra evidencia de modo borrador (estado "Borrador" o botón "Enviar tarea")
+export function detectarModoBorrador(viewHtml: string): true | undefined {
+  const $ = cheerio.load(viewHtml);
+  const tabla = $("table.generaltable").text().replace(/\s+/g, " ");
+  if (/Estado de la entrega\s*Borrador/i.test(tabla)) return true;
+  if ($('form[action*="/mod/assign/view.php"] input[name="action"][value="submit"]').length > 0) return true;
+  return undefined;
 }
 
 // 1. Guarda un borrador de tarea tras inspección de estado y confirmación física en Canal B
@@ -168,6 +175,7 @@ export async function guardarBorradorTarea(
     "Curso Moodle";
   const fechaVencimiento =
     $view("tr:contains('Fecha de entrega'), tr:contains('Due date')").find("td").first().text().trim() ||
+    $view("[data-region='activity-dates'], .activity-dates").text().replace(/\s+/g, " ").trim().slice(0, 120) ||
     undefined;
 
   // Límite estricto de texto para garantizar que quepa completo y sin truncar en el diálogo (máx 350)
@@ -190,7 +198,11 @@ export async function guardarBorradorTarea(
   }
 
   // Verificar si la tarea permite entregas / edición
-  const puedeEditar = viewHtml.includes("action=editsubmission") || viewHtml.includes("action=editprevioussubmission");
+  // En EVA el botón "Agregar/Editar entrega" es un formulario GET con inputs ocultos id + action=editsubmission
+  const puedeEditar =
+    viewHtml.includes("action=editsubmission") ||
+    viewHtml.includes("action=editprevioussubmission") ||
+    $view('input[name="action"][value="editsubmission"], input[name="action"][value="editprevioussubmission"]').length > 0;
   const noAceptaEntregas =
     viewHtml.includes("No se aceptan entregas") ||
     viewHtml.includes("La fecha límite ha pasado") ||
@@ -228,29 +240,10 @@ export async function guardarBorradorTarea(
     );
   }
 
-  // 3. Determinar si la tarea es entrega definitiva mediante submissiondrafts (API oficial)
-  let esEntregaDefinitiva = false;
-  let entregaDefinitivaDeterminada = false;
-  let targetAssignId: number | undefined;
-  try {
-    const courseLink = $view(".breadcrumb a[href*='/course/view.php']").attr("href") || "";
-    const courseIdMatch = /[?&]id=(\d+)/.exec(courseLink);
-    const courseId = courseIdMatch ? parseInt(courseIdMatch[1], 10) : undefined;
-    const assignsData = await evaAjaxRpc<{
-      courses?: Array<{ assignments?: Array<{ id: number; cmid: number; submissiondrafts?: number }> }>;
-    }>("mod_assign_get_assignments", courseId ? { courseids: [courseId] } : {});
-    const allAssignments = assignsData?.courses?.flatMap((c) => c.assignments || []) || [];
-    const matchedAssign = allAssignments.find((a) => a.cmid === cmid);
-    if (matchedAssign) {
-      targetAssignId = matchedAssign.id;
-      if (matchedAssign.submissiondrafts !== undefined) {
-        esEntregaDefinitiva = matchedAssign.submissiondrafts === 0;
-        entregaDefinitivaDeterminada = true;
-      }
-    }
-  } catch {
-    // Si la llamada RPC no está disponible, se indicará en el diálogo que el tipo de entrega no se pudo determinar
-  }
+  // 3. Determinar si la tarea es entrega definitiva leyendo la página de la tarea
+  // (mod_assign_get_assignments está deshabilitado en EVA). Solo se afirma lo que la página muestra:
+  // "Borrador (no enviado)" o el botón "Enviar tarea" indican que hay confirmación separada; "Enviado para calificar" indica entrega ya enviada.
+  const modoBorradorConfirmado = detectarModoBorrador(viewHtml);
 
   let validatedFilePath: string | undefined;
   let expectedSha256: string | undefined;
@@ -272,9 +265,7 @@ export async function guardarBorradorTarea(
   if (tieneEntregaPrevia) {
     advertencia += "\n⚠️ ADVERTENCIA: Esta tarea ya posee una entrega previa. Guardar reemplazará los archivos/textos anteriores.\n";
   }
-  if (esEntregaDefinitiva) {
-    advertencia += "\n⚠️ ATENCIÓN: Esta tarea no requiere confirmación de entrega separada. Guardar constituirá la ENTREGA DEFINITIVA.\n";
-  } else if (entregaDefinitivaDeterminada) {
+  if (modoBorradorConfirmado) {
     advertencia += "\nNota: Esta acción guarda un borrador. La entrega definitiva requerirá confirmación posterior en EVA.\n";
   } else {
     advertencia += "\n⚠️ AVISO: No se pudo verificar si la tarea exige confirmación de entrega o si el guardado constituye entrega definitiva. Verificá tu entrega en EVA tras guardar.\n";
@@ -291,16 +282,10 @@ export async function guardarBorradorTarea(
   // Canal B: Diálogo modal nativo obligatorio antes de cualquier mutación
   const aprobado = await showNativeConfirmation(
     {
-      titulo: esEntregaDefinitiva
-        ? "Confirmar entrega definitiva - EVA UCA"
-        : !entregaDefinitivaDeterminada
-        ? "Confirmar entrega / borrador - EVA UCA"
-        : "Confirmar borrador de tarea - EVA UCA",
-      accion: esEntregaDefinitiva
-        ? "Guardar entrega definitiva en EVA"
-        : !entregaDefinitivaDeterminada
-        ? "Guardar archivo/texto en EVA (estado de borrador no verificado)"
-        : "Guardar borrador de entrega (Modo editable)",
+      titulo: modoBorradorConfirmado ? "Confirmar borrador de tarea - EVA UCA" : "Confirmar entrega / borrador - EVA UCA",
+      accion: modoBorradorConfirmado
+        ? "Guardar borrador de entrega (Modo editable)"
+        : "Guardar archivo/texto en EVA (estado de borrador no verificado)",
       entidad: `${nombreTarea} (${nombreCurso})`,
       detalle: detalleDialogo
     },
@@ -420,36 +405,11 @@ export async function guardarBorradorTarea(
       throw new Error(`Moodle rechazó el guardado de la entrega: ${hasError}`);
     }
 
+    // El estado real se lee de la página tras guardar: "Enviado para calificar" = entrega definitiva; "Borrador" = falta confirmar el envío
+    const esEntregaDefinitiva = /Estado de la entrega\s*Enviado para calificar/i.test($check("table.generaltable").text().replace(/\s+/g, " "));
+
     if (rutaArchivo) {
       const baseName = path.basename(validatedFilePath || rutaArchivo);
-      let detectedInApi = false;
-      if (targetAssignId) {
-        try {
-          const statusRes = await evaAjaxRpc<{
-            lastattempt?: {
-              submission?: {
-                plugins?: Array<{
-                  fileareas?: Array<{
-                    files?: Array<{ filename?: string }>;
-                  }>;
-                }>;
-              };
-            };
-          }>("mod_assign_get_submission_status", { assignid: targetAssignId });
-
-          const apiFiles = statusRes?.lastattempt?.submission?.plugins
-            ?.flatMap((p) => p.fileareas || [])
-            ?.flatMap((fa) => fa.files || [])
-            ?.map((f) => f.filename) || [];
-
-          if (apiFiles.includes(baseName)) {
-            detectedInApi = true;
-          }
-        } catch {
-          // Fallback a detección en HTML
-        }
-      }
-
       let detectedInHtml = false;
       if (checkHtml.includes(baseName) || checkHtml.includes(encodeURIComponent(baseName))) {
         detectedInHtml = true;
@@ -458,12 +418,12 @@ export async function guardarBorradorTarea(
         detectedInHtml = $check.text().includes(baseName);
       }
 
-      if (!detectedInApi && !detectedInHtml) {
-        logger.warn(`El nombre de archivo ${baseName} no se detectó ni en mod_assign_get_submission_status ni en el HTML post-guardado.`);
+      if (!detectedInHtml) {
+        logger.warn(`El nombre de archivo ${baseName} no se detectó en el HTML post-guardado de la tarea.`);
         return {
           exito: false,
           aprobado: true,
-          mensaje: `Estado desconocido: La solicitud de guardado de entrega fue enviada pero el archivo '${baseName}' no pudo ser verificado ni en la API ni en el resumen de la tarea #${cmid}. NO reintentes el guardado de inmediato para evitar sobrescrituras. Verificá en el aula virtual: https://eva.uca.edu.ar/mod/assign/view.php?id=${cmid}`,
+          mensaje: `Estado desconocido: La solicitud de guardado de entrega fue enviada pero el archivo '${baseName}' no pudo ser verificado en el resumen de la tarea #${cmid}. NO reintentes el guardado de inmediato para evitar sobrescrituras. Verificá en el aula virtual: https://eva.uca.edu.ar/mod/assign/view.php?id=${cmid}`,
           instruccion: "NO reintentes inmediatamente. Verificá en EVA Moodle antes de volver a enviar.",
           detalles: {
             cmid,
@@ -498,6 +458,35 @@ export async function guardarBorradorTarea(
     logger.error(`Error al guardar borrador en Moodle cmid ${cmid}`, err);
     throw err;
   }
+}
+
+// Serializa el formulario de respuesta de Moodle (post.php) con asunto y mensaje; excluye botones y cancelación
+export function buildForumReplyFormData(formHtml: string, asunto: string, mensaje: string): URLSearchParams {
+  const $ = cheerio.load(formHtml);
+  const body = new URLSearchParams();
+  $("form#mformforum input, form#mformforum select, form#mformforum textarea").each((_, el) => {
+    const $el = $(el);
+    const name = $el.attr("name");
+    if (!name) return;
+    const type = ($el.attr("type") || "").toLowerCase();
+    if (type === "submit" || type === "button" || type === "reset" || type === "image" || type === "file") return;
+    if (name === "cancel" || name === "cancelbutton") return;
+    if ((type === "checkbox" || type === "radio") && !$el.is(":checked")) return;
+    if (name === "subject" || name === "message[text]" || name === "message[format]") return;
+    const val = $el.val();
+    if (Array.isArray(val)) val.forEach((v) => body.append(name, v));
+    else if (val !== undefined && !(el.tagName === "select" && val === "")) body.append(name, String(val ?? ""));
+  });
+  body.set("subject", asunto);
+  const html = mensaje
+    .replace(/\r\n|\r/g, "\n")
+    .split("\n")
+    .map((l) => `<p>${escapeHtml(l)}</p>`)
+    .join("");
+  body.set("message[text]", html);
+  body.set("message[format]", "1");
+  body.set("submitbutton", "Enviar al foro");
+  return body;
 }
 
 // 2. Publica un mensaje en un foro de cátedra tras confirmación física en Canal B
@@ -537,6 +526,15 @@ export async function responderForo(
   }
 
   const { parentPostId, replySubject, nombreForo, autorOriginal } = forumCtx;
+
+  // Formulario de respuesta de la interfaz web (GET sin efectos): valida permiso para publicar y entrega sesskey/campos ocultos
+  const replyRes = await evaFetch(`/mod/forum/post.php?reply=${parentPostId}`);
+  const replyHtml = await replyRes.text();
+  if (!cheerio.load(replyHtml)("form#mformforum").length) {
+    throw new Error(
+      `No podés responder en la discusión #${discusionId}: EVA no habilita el formulario de respuesta (por ejemplo, foro de avisos de solo lectura o discusión cerrada).`
+    );
+  }
   const baseSubject = replySubject.startsWith("Re: ") ? replySubject.slice(4) : replySubject;
 
   const detalleDialogo = `Foro: ${nombreForo}\nDocente/Autor original: ${autorOriginal}\nAsunto: ${replySubject}\n\nMensaje a publicar:\n"${msgClean}"\n\nEste mensaje será visible por todos los alumnos y docentes del curso.`;
@@ -569,19 +567,27 @@ export async function responderForo(
   }
 
   try {
-    const formattedMsg = msgClean
-      .split("\n")
-      .map((l) => `<p>${escapeHtml(l)}</p>`)
-      .join("");
+    const postBody = buildForumReplyFormData(replyHtml, replySubject, msgClean);
 
-    const res = await evaAjaxRpc<{ postid?: number }>("mod_forum_add_discussion_post", {
-      postid: parentPostId,
-      subject: replySubject,
-      message: formattedMsg,
-      options: []
+    const postRes = await evaFetch("/mod/forum/post.php", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: postBody.toString()
     });
+    if (!postRes.ok) {
+      throw new Error(`Error HTTP ${postRes.status} al publicar la respuesta en el foro.`);
+    }
 
-    logger.audit("foro_respuesta_publicada", { discusionId, parentPostId, postid: res?.postid });
+    // Éxito = Moodle redirige a la discusión; si re-muestra el formulario, rechazó el envío
+    const postHtml = await postRes.text();
+    const $post = cheerio.load(postHtml);
+    if ($post("form#mformforum").length > 0 || /_qf__mod_forum_post_form/.test(postHtml)) {
+      const err = $post(".alert-danger, .errormessage, .invalid-feedback, .form-control-feedback").text().replace(/\s+/g, " ").trim();
+      throw new Error(`Moodle rechazó la respuesta del foro: ${err || "el formulario volvió a mostrarse con errores de validación"}`);
+    }
+    clearEvaCache();
+
+    logger.audit("foro_respuesta_publicada", { discusionId, parentPostId });
 
     return {
       exito: true,
@@ -589,7 +595,6 @@ export async function responderForo(
       detalles: {
         discusionId,
         parentPostId,
-        postId: res?.postid,
         asunto: replySubject
       }
     };

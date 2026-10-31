@@ -141,6 +141,32 @@ pi mcp add uca -- uca-mcp serve
 
 ---
 
+### Configuración manual (JSON) para cualquier cliente
+
+Si tu cliente no está listado, agregá el servidor a su archivo de configuración MCP (`mcpServers`). Con la instalación global:
+
+```json
+{
+  "mcpServers": {
+    "uca": { "command": "uca-mcp", "args": ["serve"] }
+  }
+}
+```
+
+Sin instalación global (descarga y cachea el paquete la primera vez):
+
+```json
+{
+  "mcpServers": {
+    "uca": { "command": "npx", "args": ["-y", "uca-mcp", "serve"] }
+  }
+}
+```
+
+> En **Windows**, algunos clientes no resuelven `npx` directamente: usá `"command": "cmd"` con `"args": ["/c", "npx", "-y", "uca-mcp", "serve"]`. En Codex CLI el formato equivalente es TOML (`[mcp_servers.uca]` con `command` y `args`). Ejecutá `uca-mcp login` una vez antes de usarlo.
+
+---
+
 ### Verificar que todo funcione (opcional)
 
 Desde cualquier terminal, después de instalar y loguearte:
@@ -180,6 +206,7 @@ Comprueba Node.js, llavero del sistema, navegador, diálogo nativo y conectivida
 | `guarani_materias_habilitadas` | SIU Guaraní | Lectura | Computa qué materias pendientes podés cursar el próximo período según tu grafo de correlativas. |
 | `guarani_estado_cursada` | SIU Guaraní | Lectura | Horarios, asistencias acumuladas, porcentaje de faltas y predictor de regularidad de cursadas activas. |
 | `guarani_horario_semanal` | SIU Guaraní | Lectura | Horario semanal estructurado con materias, días, horarios, aulas y comisiones (admite filtro 'hoy'). |
+| `guarani_cronograma_evaluaciones` | SIU Guaraní | Lectura | Fechas oficiales de parciales, recuperatorios y otras evaluaciones de tus cursadas actuales. |
 | `guarani_historia_academica`| SIU Guaraní | Lectura | Analítico completo: finales aprobados, materias regulares, libro, folio y promedios. |
 | `guarani_mesas_disponibles` | SIU Guaraní | Lectura | Mesas de examen final con fechas, turnos, tribunales y estado de inscripción. |
 | `guarani_mis_inscripciones_examen` | SIU Guaraní | Lectura | Consulta inscripciones vigentes a examen final y actuaciones provisorias. |
