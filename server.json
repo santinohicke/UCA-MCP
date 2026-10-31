@@ -6,12 +6,12 @@
     "url": "https://github.com/santinohicke/UCA-MCP",
     "source": "github"
   },
-  "version": "1.0.9",
+  "version": "1.0.10",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "uca-mcp",
-      "version": "1.0.9",
+      "version": "1.0.10",
       "transport": {
         "type": "stdio"
       }

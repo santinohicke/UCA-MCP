@@ -2,7 +2,7 @@
   "manifest_version": "0.1",
   "name": "uca-mcp",
   "display_name": "UCA MCP",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Conectá EVA, SIU Guaraní y Campus Autogestión con Claude sin usar la terminal.",
   "author": {
     "name": "Santino Hickethier",
@@ -23,7 +23,7 @@
     "habilitar_escritura": {
       "type": "boolean",
       "title": "Habilitar acciones de escritura en EVA y Guaraní (entregas, foros, certificados y finales)",
-      "description": "Permite activar las herramientas de mutación para subir entregas de tareas, responder en foros, inscribir a finales y solicitar certificados tras confirmación física.",
+      "description": "Permite activar las herramientas de mutación para subir entregas de tareas, responder en foros, inscribir a finales y solicitar certificados tras confirmación del usuario.",
       "default": true
     }
   },
@@ -95,11 +95,11 @@
     },
     {
       "name": "eva_guardar_borrador_tarea",
-      "description": "[EXPERIMENTAL] Sube un archivo o texto a EVA en modo borrador editable (Canal B)."
+      "description": "[EXPERIMENTAL] Sube un archivo o texto a EVA en modo borrador editable."
     },
     {
       "name": "eva_responder_foro",
-      "description": "Publica una respuesta en un foro de cátedra de EVA (Canal B)."
+      "description": "Publica una respuesta en un foro de cátedra de EVA."
     },
     {
       "name": "guarani_progreso_carrera",
@@ -151,11 +151,11 @@
     },
     {
       "name": "guarani_inscribir_examen",
-      "description": "Inscribe formalmente a un examen final en SIU Guaraní mediante ciclo en dos fases y confirmación física en Canal B."
+      "description": "Inscribe formalmente a un examen final en SIU Guaraní mediante ciclo en dos fases y confirmación del usuario."
     },
     {
       "name": "guarani_certificado_alumno_regular",
-      "description": "Emite y descarga formalmente en PDF la Constancia de Alumno Regular (o de actividades aprobadas/promedio) con código de validación institucional desde SIU Guaraní (Canal B)."
+      "description": "Emite y descarga formalmente en PDF la Constancia de Alumno Regular (o de actividades aprobadas/promedio) con código de validación institucional desde SIU Guaraní."
     },
     {
       "name": "campus_aranceles_y_tramites",

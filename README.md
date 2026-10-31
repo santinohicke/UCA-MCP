@@ -14,7 +14,7 @@ Servidor **Model Context Protocol (MCP)** open source para conectar a tus asiste
 > **Privacidad y Tratamiento de Datos:**  
 > - El software opera 100% de manera **local** en tu computadora.  
 > - Las credenciales se cifran localmente en tu computadora y se resguardan en el **Llavero nativo del Sistema Operativo** (Windows DPAPI, macOS Keychain, Linux Secret Service).    
-> - Todas las subidas (entrega de tareas, respuestas a foros o inscripciones) están protegidas por una confirmación explícita del usuario (**Canal B / Elicitation**).  
+> - Todas las subidas (entrega de tareas, respuestas a foros o inscripciones) están protegidas por una confirmación explícita del usuario (ventana de confirmación del cliente, o un diálogo del sistema si el cliente no la ofrece).  
 
 ---
 
@@ -30,7 +30,7 @@ Elegí tu cliente y seguí los pasos. El `uca-mcp login` abre el navegador para 
 
 **Opción A — Sin terminal (recomendada):**
 
-1. Descargá [`uca-mcp-1.0.9.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
+1. Descargá [`uca-mcp-1.0.10.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
 2. En Claude Desktop andá a **Configuración → Extensiones** y arrastrá el archivo `.mcpb`.
 3. Abrí un nuevo chat y escribí *"Iniciá sesión en UCA"*. Listo.
 
@@ -186,8 +186,8 @@ Comprueba Node.js, llavero del sistema, navegador, diálogo nativo y conectivida
 | `eva_hilo_foro` | EVA | Lectura | Obtiene el debate o hilo completo de un foro de cátedra con todas sus respuestas y mensajes. |
 | `eva_buscar_materiales` | EVA | Lectura | Busca recursos y consignas por palabra clave en todas tus aulas. |
 | `eva_leer_archivo` | EVA | Lectura | Descarga y extrae texto de PDFs y Office (.docx/.xlsx/.pptx) con allowlist estricta HTTPS y anti zip-bombs. |
-| `eva_guardar_borrador_tarea` | EVA | Mutación | Sube un borrador editable de entrega tras validación y **aprobación física en Canal B**. |
-| `eva_responder_foro` | EVA | Mutación | Publica una respuesta en un foro mostrando el texto completo tras **aprobación en Canal B**. |
+| `eva_guardar_borrador_tarea` | EVA | Mutación | Sube un borrador editable de entrega tras validación y **tu confirmación**. |
+| `eva_responder_foro` | EVA | Mutación | Publica una respuesta en un foro mostrando el texto completo tras **tu confirmación**. |
 | `guarani_progreso_carrera` | SIU Guaraní | Lectura | Responde exactamente cuántas materias te faltan para recibirte, cuáles estás cursando y el avance por año. |
 | `guarani_plan_optimo` | SIU Guaraní | Lectura | Calcula el plan óptimo de cursada rankeando materias por cierre transitivo de correlativas y camino crítico. |
 | `guarani_materias_habilitadas` | SIU Guaraní | Lectura | Computa qué materias pendientes podés cursar el próximo período según tu grafo de correlativas. |
@@ -200,8 +200,8 @@ Comprueba Node.js, llavero del sistema, navegador, diálogo nativo y conectivida
 | `guarani_encuestas_pendientes` | SIU Guaraní | Lectura | Verifica si hay encuestas docentes institucionales obligatorias o pendientes de responder. |
 | `guarani_historial_constancias` | SIU Guaraní | Lectura | Consulta el historial de solicitudes de constancias y certificados emitidos con descarga de PDF. |
 | `guarani_correlatividades_y_plan` | SIU Guaraní | Lectura | Plan interactivo, materias por año, correlativas para cursar/rendir e impacto a futuro. |
-| `guarani_certificado_alumno_regular` | SIU Guaraní | Mutación | Emite y descarga formalmente en PDF la Constancia de Alumno Regular (o aprobadas/promedio) con código de validación institucional tras **aprobación en Canal B**. |
-| `guarani_inscribir_examen` | SIU Guaraní | Mutación | Ciclo atómico en 2 fases con confirmación física en Canal B. **Nota:** La baja de examen no está disponible vía MCP (v1) y debe realizarse en [SIU Guaraní](https://guarani.uca.edu.ar). |
+| `guarani_certificado_alumno_regular` | SIU Guaraní | Mutación | Emite y descarga formalmente en PDF la Constancia de Alumno Regular (o aprobadas/promedio) con código de validación institucional tras **tu confirmación**. |
+| `guarani_inscribir_examen` | SIU Guaraní | Mutación | Ciclo atómico en 2 fases con tu confirmación. **Nota:** La baja de examen no está disponible vía MCP (v1) y debe realizarse en [SIU Guaraní](https://guarani.uca.edu.ar). |
 | `campus_aranceles_y_tramites`| Campus | Lectura | Consulta de cuotas al día/pendientes y estado de trámites administrativos (estricto read-only). |
 
 ---
@@ -209,14 +209,14 @@ Comprueba Node.js, llavero del sistema, navegador, diálogo nativo y conectivida
 ## Seguridad y Arquitectura
 
 1. **Blindaje de STDOUT (`src/silence-stdout.ts`)**: Todo log, advertencia o salida de procesos secundarios se redirige a `stderr`. El transporte JSON-RPC corre exclusivamente sobre `mcpStdoutStream`, garantizando que la trama no se corrompa jamás.
-2. **Canal B Independiente y Elicitation**: Las acciones de mutación no pueden ser auto-aprobadas por el LLM ni por inyecciones de prompt. Se despliega una ventana modal nativa del sistema operativo (`WScript.Shell.Popup` en Windows, `osascript` en macOS, `zenity` / `kdialog` / `yad` en Linux) con botón *Cancelar* por defecto y timeout de 45 segundos (fail-closed). En entornos headless o donde las ventanas nativas no estén disponibles, conmuta de forma transparente a Canal A (formulario interactivo MCP Elicitation) sin falsos rechazos de usuario.
+2. **Confirmación independiente del LLM**: Las acciones de mutación no pueden ser auto-aprobadas por el LLM ni por inyecciones de prompt. Primero se usa el formulario de confirmación del propio cliente (MCP Elicitation, Canal A), que es el más cómodo. Si el cliente no lo soporta, se despliega una ventana modal nativa del sistema operativo (Canal B: `WScript.Shell.Popup` en Windows, `osascript` en macOS, `zenity` / `kdialog` / `yad` en Linux) con botón *Cancelar* por defecto y timeout de 45 segundos (fail-closed).
 3. **Llavero Nativo y Cero Secretos en `argv`**: Las claves maestras se manejan mediante canal `stdin` (en Windows DPAPI, macOS Keychain mediante `security -i`, y Linux Secret Service vía `secret-tool` con soporte de `UCA_PASSPHRASE` y fallback degradado a `machine-id`), evitando que secretos aparezcan en `ps` o en variables de entorno. Asimismo, las cookies de sesión de Entra ID se alojan en el perfil persistente de navegador (`browser-profile/`), protegidas bajo el cifrado nativo de Chromium en el sistema operativo (DPAPI en Windows). En macOS y Linux, el aislamiento recae en los permisos de archivo locales del usuario del sistema operativo. El comando `uca-mcp logout` (o invocar `uca_iniciar_sesion` con `forzar_relogin: true`) purga este directorio y los certificados descargados por completo.
 4. **Protección Anti-SSRF y Anti Zip-Bomb**:
    - Descargas restringidas exclusivamente a `https://eva.uca.edu.ar` bajo `/pluginfile.php` o `/mod/`.
    - Streaming de descarga con límite rígido de 25 MB.
    - Descompresión en streaming con `BoundedUnzipInflate` de `fflate` para abortar inmediatamente durante la descompresión si los bytes reales superan los 60 MB, neutralizando cabeceras falsificadas.
 5. **Modelo de Amenazas y Límites de Seguridad del Sistema Operativo**:
-   - Canal B y Elicitation previenen inyecciones de prompt indirectas, escalamiento de contexto o ejecución autónoma no autorizada de herramientas por parte del LLM.
+   - La confirmación del usuario previene inyecciones de prompt indirectas, escalamiento de contexto o ejecución autónoma no autorizada de herramientas por parte del LLM.
    - **Límites de aislamiento del host:** Si un agente de IA o proceso secundario posee permisos de shell o ejecución arbitraria de comandos en el sistema operativo bajo la misma cuenta de usuario (mismo UID/SID), dicho proceso tiene acceso nativo al sistema de archivos local y podría leer las cookies de sesión, el llavero o los perfiles de navegador. Se recomienda ejecutar agentes con acceso a shell en entornos aislados o contenedores.
 
 ---

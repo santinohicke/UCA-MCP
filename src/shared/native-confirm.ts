@@ -288,25 +288,8 @@ export async function showNativeConfirmation(
       );
       const hasGui = !isHeadless;
 
-      // Si hay entorno gráfico disponible, Canal B (diálogo modal del SO) es prioritario y obligatorio
-      // para prevenir que el propio arnés del LLM auto-apruebe la acción
-      if (hasGui) {
-        const outcome = await spawnPlatformDialog(details);
-        if (outcome === "approved") {
-          return true;
-        }
-        if (outcome === "denied") {
-          rejectionCooldownUntil = Date.now() + REJECTION_COOLDOWN_MS;
-          return false;
-        }
-        if (outcome === "timeout") {
-          rejectionCooldownUntil = Date.now() + REJECTION_COOLDOWN_MS;
-          throw new ConfirmationTimeoutError("Confirmación expirada por timeout (45s sin respuesta del usuario).");
-        }
-        // outcome === "unavailable": fallback a Canal A abajo si está configurado
-      }
-
-      // Fallback a Canal A (Elicitation MCP) si no hay GUI o Canal B no estuvo disponible
+      // Canal A (Elicitation MCP) es la primera opción: es el más prolijo y cómodo si el cliente lo soporta.
+      // Si el handler devuelve null (el cliente no lo soporta o falló el transporte), se pasa a Canal B.
       if (elicitationHandler) {
         try {
           const elicited = await elicitationHandler(details);
@@ -323,6 +306,22 @@ export async function showNativeConfirmation(
             throw err;
           }
           // Fallback transparente si falla el transporte de elicitation
+        }
+      }
+
+      // Canal B (diálogo modal nativo del SO) cuando el cliente no soporta Elicitation
+      if (hasGui) {
+        const outcome = await spawnPlatformDialog(details);
+        if (outcome === "approved") {
+          return true;
+        }
+        if (outcome === "denied") {
+          rejectionCooldownUntil = Date.now() + REJECTION_COOLDOWN_MS;
+          return false;
+        }
+        if (outcome === "timeout") {
+          rejectionCooldownUntil = Date.now() + REJECTION_COOLDOWN_MS;
+          throw new ConfirmationTimeoutError("Confirmación expirada por timeout (45s sin respuesta del usuario).");
         }
       }
 

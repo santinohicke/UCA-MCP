@@ -57,7 +57,7 @@ export function parseGuaraniInscripcionResponse(resText: string): {
   return { errorMsg, comprobanteText };
 }
 
-// Inscripción a examen final en SIU Guaraní con ciclo atómico en dos fases y confirmación física en Canal B
+// Inscripción a examen final en SIU Guaraní con ciclo atómico en dos fases y confirmación del usuario
 export async function inscribirExamen(
   params: InscribirExamenParams,
   onProgress?: (msg: string, pct?: number) => Promise<void> | void
@@ -65,7 +65,7 @@ export async function inscribirExamen(
   const { carrera, materia, llamadoId } = params;
 
   // ==========================================
-  // FASE 1: Consulta y Presentación en Canal B
+  // FASE 1: Consulta y Presentación de la confirmación
   // (Sin retener ningún mutex de sesión)
   // ==========================================
   await onProgress?.("Consultando mesas de examen en SIU Guaraní...");
@@ -99,11 +99,11 @@ export async function inscribirExamen(
       entidad: `${mesa.materia} (${carrera})`,
       detalle: detalleConfirmacion
     },
-    (tick = 1) => onProgress?.(`Esperando confirmación física en Canal B... (${tick * 4}s)`, 50 + Math.min(45, tick * 3))
+    (tick = 1) => onProgress?.(`Esperando tu confirmación... (${tick * 4}s)`, 50 + Math.min(45, tick * 3))
   );
 
   if (!aprobado) {
-    logger.info(`Inscripción a examen para ${materia} cancelada por el usuario en Canal B`);
+    logger.info(`Inscripción a examen para ${materia} cancelada por el usuario`);
     return {
       exito: false,
       aprobado: false,
@@ -541,8 +541,8 @@ export async function solicitarCertificadoAlumnoRegular(
     }
   }
 
-  // 3. Confirmación física en Canal B para emitir nueva constancia institucional
-  await onProgress?.("Presentando confirmación en Canal B...", 30);
+  // 3. Confirmación del usuario para emitir nueva constancia institucional
+  await onProgress?.("Presentando confirmación...", 30);
   const aprobado = await showNativeConfirmation(
     {
       titulo: "Confirmar solicitud de constancia - SIU Guaraní",
@@ -550,15 +550,15 @@ export async function solicitarCertificadoAlumnoRegular(
       entidad: `${constanciaInfo.nombre} (${activeCareer || "Carrera activa"})`,
       detalle: `Tipo: ${constanciaInfo.nombre}\nPresentar a: ${presentarA}\nCopias: ${safeCopias}\n${observaciones ? `Observaciones: ${observaciones}\n` : ""}\nNota: Esta acción registrará formalmente una solicitud de constancia oficial con código de verificación institucional en tu legajo de SIU Guaraní.`
     },
-    (tick = 1) => onProgress?.(`Esperando confirmación física en Canal B... (${tick * 4}s)`, 50)
+    (tick = 1) => onProgress?.(`Esperando tu confirmación... (${tick * 4}s)`, 50)
   );
 
   if (!aprobado) {
-    logger.info(`Solicitud de constancia ${constanciaInfo.nombre} cancelada por el usuario en Canal B`);
+    logger.info(`Solicitud de constancia ${constanciaInfo.nombre} cancelada por el usuario`);
     return {
       exito: false,
       aprobado: false,
-      mensaje: "Solicitud de constancia cancelada por el usuario en Canal B.",
+      mensaje: "Solicitud de constancia cancelada por el usuario.",
       tipoConstancia: constanciaInfo.nombre,
       presentarA,
       copias: safeCopias,

@@ -143,7 +143,7 @@ export function detectarModoBorrador(viewHtml: string): true | undefined {
   return undefined;
 }
 
-// 1. Guarda un borrador de tarea tras inspección de estado y confirmación física en Canal B
+// 1. Guarda un borrador de tarea tras inspección de estado y confirmación del usuario
 export async function guardarBorradorTarea(
   params: GuardarBorradorParams,
   onProgress?: (msg: string, pct?: number) => Promise<void> | void
@@ -288,7 +288,7 @@ export async function guardarBorradorTarea(
     );
   }
 
-  // Canal B: Diálogo modal nativo obligatorio antes de cualquier mutación
+  // Confirmación: Elicitation o diálogo modal nativo obligatorio antes de cualquier mutación
   const aprobado = await showNativeConfirmation(
     {
       titulo: modoBorradorConfirmado ? "Confirmar borrador de tarea - EVA UCA" : "Confirmar entrega / borrador - EVA UCA",
@@ -298,11 +298,11 @@ export async function guardarBorradorTarea(
       entidad: `${nombreTarea} (${nombreCurso})`,
       detalle: detalleDialogo
     },
-    (tick = 1) => onProgress?.(`Esperando confirmación física en Canal B... (${tick * 4}s)`, 50 + Math.min(45, tick * 3))
+    (tick = 1) => onProgress?.(`Esperando tu confirmación... (${tick * 4}s)`, 50 + Math.min(45, tick * 3))
   );
 
   if (!aprobado) {
-    logger.info(`Guardado para cmid ${cmid} cancelado por el usuario en Canal B`);
+    logger.info(`Guardado para cmid ${cmid} cancelado por el usuario`);
     return {
       exito: false,
       aprobado: false,
@@ -500,7 +500,7 @@ export function buildForumReplyFormData(formHtml: string, asunto: string, mensaj
   return body;
 }
 
-// 2. Publica un mensaje en un foro de cátedra tras confirmación física en Canal B
+// 2. Publica un mensaje en un foro de cátedra tras confirmación del usuario
 export async function responderForo(
   discusionId: number,
   mensaje: string,
@@ -556,7 +556,7 @@ export async function responderForo(
     );
   }
 
-  // Canal B: Diálogo modal nativo mostrando el contenido exacto y completo a publicar (sin truncado)
+  // Confirmación: Elicitation o diálogo modal nativo mostrando el contenido exacto y completo a publicar (sin truncado)
   const aprobado = await showNativeConfirmation(
     {
       titulo: "Confirmar respuesta en foro - EVA UCA",
@@ -564,11 +564,11 @@ export async function responderForo(
       entidad: `"${baseSubject}" (${nombreForo})`,
       detalle: detalleDialogo
     },
-    (tick = 1) => onProgress?.(`Esperando confirmación física en Canal B... (${tick * 4}s)`, 50 + Math.min(45, tick * 3))
+    (tick = 1) => onProgress?.(`Esperando tu confirmación... (${tick * 4}s)`, 50 + Math.min(45, tick * 3))
   );
 
   if (!aprobado) {
-    logger.info(`Publicación en foro #${discusionId} cancelada por el usuario en Canal B`);
+    logger.info(`Publicación en foro #${discusionId} cancelada por el usuario`);
     return {
       exito: false,
       aprobado: false,

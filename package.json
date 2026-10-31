@@ -1,6 +1,6 @@
 {
   "name": "uca-mcp",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Model Context Protocol (MCP) server para la Universidad Católica Argentina (UCA) - Proyecto No Oficial",
   "type": "module",
   "bin": {
