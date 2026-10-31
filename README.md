@@ -12,9 +12,8 @@ Servidor **Model Context Protocol (MCP)** open source para conectar a tus asiste
 ---
 
 > **Privacidad y Tratamiento de Datos:**  
-> - **Zero-Telemetry Propia:** El software opera 100% de manera local en tu computadora.  
-> - Las credenciales y sesiones se cifran localmente en tu computadora y se resguardan en el **Llavero nativo del Sistema Operativo** (Windows DPAPI, macOS Keychain, Linux Secret Service).  
-> - Ninguna contraseña se guarda en texto plano ni se expone al modelo de inteligencia artificial.  
+> - El software opera 100% de manera **local** en tu computadora.  
+> - Las credenciales se cifran localmente en tu computadora y se resguardan en el **Llavero nativo del Sistema Operativo** (Windows DPAPI, macOS Keychain, Linux Secret Service).    
 > - Todas las subidas (entrega de tareas, respuestas a foros o inscripciones) están protegidas por una confirmación explícita del usuario (**Canal B / Elicitation**).  
 
 ---
@@ -31,7 +30,7 @@ Elegí tu cliente y seguí los pasos. El `uca-mcp login` abre el navegador para 
 
 **Opción A — Sin terminal (recomendada):**
 
-1. Descargá [`uca-mcp-1.0.7.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
+1. Descargá [`uca-mcp-1.0.8.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
 2. En Claude Desktop andá a **Configuración → Extensiones** y arrastrá el archivo `.mcpb`.
 3. Abrí un nuevo chat y escribí *"Iniciá sesión en UCA"*. Listo.
 
@@ -152,18 +151,6 @@ Si tu cliente no está listado, agregá el servidor a su archivo de configuraci�
   }
 }
 ```
-
-Sin instalación global (descarga y cachea el paquete la primera vez):
-
-```json
-{
-  "mcpServers": {
-    "uca": { "command": "npx", "args": ["-y", "uca-mcp", "serve"] }
-  }
-}
-```
-
-> En **Windows**, algunos clientes no resuelven `npx` directamente: usá `"command": "cmd"` con `"args": ["/c", "npx", "-y", "uca-mcp", "serve"]`. En Codex CLI el formato equivalente es TOML (`[mcp_servers.uca]` con `command` y `args`). Ejecutá `uca-mcp login` una vez antes de usarlo.
 
 ---
 
