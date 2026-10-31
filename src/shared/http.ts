@@ -100,7 +100,7 @@ async function fetchWithRetry(url: string, init: RequestInit & { priority?: Fetc
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       let res: Response;
       // Signal por intento para que un reintento no herede un timeout ya expirado o consumido
-      const attemptSignal = init.signal ?? AbortSignal.timeout(20000);
+      const attemptSignal = init.signal ?? AbortSignal.timeout(30000);
       try {
         res = await fetch(url, { ...init, signal: attemptSignal });
       } catch (networkErr: any) {
@@ -112,7 +112,9 @@ async function fetchWithRetry(url: string, init: RequestInit & { priority?: Fetc
           networkErr?.code === "ECONNRESET" ||
           networkErr?.cause?.code === "ECONNRESET" ||
           networkErr?.code === "ETIMEDOUT" ||
-          networkErr?.cause?.code === "ETIMEDOUT";
+          networkErr?.cause?.code === "ETIMEDOUT" ||
+          // Timeout propio (no cancelación del llamador): transitorio, se reintenta con señal nueva
+          (!init.signal && (networkErr?.name === "TimeoutError" || networkErr?.name === "AbortError"));
         if (isIdempotent && isTransient && attempt < maxRetries) {
           const delayMs = (attempt + 1) * 1500;
           logger.warn(`Error de red transitorio (${networkErr?.code || "desconexión"}). Reintentando en ${delayMs}ms...`);
@@ -140,7 +142,7 @@ async function fetchWithRetry(url: string, init: RequestInit & { priority?: Fetc
   }
 }
 
-// Fetch interno autenticado para EVA Moodle
+// Fetch interno autenticado para EVA
 async function rawEvaFetch(path: string, options: RequestInit = {}): Promise<Response> {
   const targetUrl = new URL(path, CONFIG.EVA_BASE_URL);
   const allowedOrigin = new URL(CONFIG.EVA_BASE_URL).origin;
@@ -232,7 +234,7 @@ async function rawEvaFetch(path: string, options: RequestInit = {}): Promise<Res
   return response!;
 }
 
-// Fetch autenticado para EVA Moodle con reintento automático mediante refresh silencioso
+// Fetch autenticado para EVA con reintento automático mediante refresh silencioso
 export async function evaFetch(
   path: string,
   options: RequestInit = {},

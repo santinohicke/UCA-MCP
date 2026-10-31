@@ -30,7 +30,7 @@ Elegí tu cliente y seguí los pasos. El `uca-mcp login` abre el navegador para 
 
 **Opción A — Sin terminal (recomendada):**
 
-1. Descargá [`uca-mcp-1.0.8.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
+1. Descargá [`uca-mcp-1.0.9.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
 2. En Claude Desktop andá a **Configuración → Extensiones** y arrastrá el archivo `.mcpb`.
 3. Abrí un nuevo chat y escribí *"Iniciá sesión en UCA"*. Listo.
 

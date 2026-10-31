@@ -7,6 +7,7 @@ import { flushPendingSessionSave } from "./auth/session.js";
 import { closeAllActiveContexts } from "./auth/browser-driver.js";
 import { logger } from "./shared/logger.js";
 import { initStorage } from "./config.js";
+import { waitForWrites } from "./shared/inflight.js";
 
 async function main() {
   initStorage();
@@ -17,6 +18,8 @@ async function main() {
   const cleanup = async (code = 0) => {
     if (isCleaningUp) return;
     isCleaningUp = true;
+    // Si hay una escritura en vuelo (inscripción, entrega, etc.), esperar hasta 10 s a que termine
+    try { await waitForWrites(10000); } catch {}
     // Salida forzada: un cierre de navegador colgado no debe dejar el proceso huérfano ni demorar al cliente
     setTimeout(() => process.exit(code), 3000).unref();
     try {

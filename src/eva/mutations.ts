@@ -113,15 +113,19 @@ export function extractForumReplyContext(
   }
 
   const parentPostId = parseInt(matchPostId[1], 10);
-  const rawSubject =
-    $disc("[data-reply-subject]").first().attr("data-reply-subject")?.trim() ||
-    $disc(".discussionname, h3, h2").first().text().trim();
-  const baseSubject = rawSubject || `Discusión ${discusionId ? `#${discusionId}` : ""}`;
+  // Normalizado (sin controles/bidi, espacios colapsados) para que el asunto enviado sea EXACTAMENTE el mostrado en el diálogo
+  const rawSubject = sanitizeDialogText(
+    $disc("[data-reply-subject]").first().attr("data-reply-subject") ||
+      $disc(".discussionname, h3, h2").first().text(),
+    200,
+    false
+  );
+  const baseSubject = rawSubject || `Discusión ${discusionId ? `#${discusionId}` : ""}`.trim();
   const replySubject = baseSubject.toLowerCase().startsWith("re:") ? baseSubject : `Re: ${baseSubject}`;
 
   const nombreForo =
-    $disc(".breadcrumb li:nth-last-child(2) a").text().trim() ||
-    $disc(".breadcrumb").text().replace(/\s+/g, " ").trim() ||
+    sanitizeDialogText($disc(".breadcrumb li:nth-last-child(2) a").text(), 100, false) ||
+    sanitizeDialogText($disc(".breadcrumb").text(), 100, false) ||
     "Foro de cátedra";
   const autorOriginal =
     $disc(".forumpost .author, .author a").first().text().replace(/\s+/g, " ").trim() ||
@@ -146,6 +150,11 @@ export async function guardarBorradorTarea(
 ): Promise<MutationResult> {
   let { cmid, rutaArchivo, textoEnLinea } = params;
 
+  // Un texto de solo espacios equivale a "sin texto": nunca se envía algo que el diálogo no muestre
+  if (typeof textoEnLinea === "string" && !textoEnLinea.trim()) {
+    textoEnLinea = undefined;
+  }
+
   if (rutaArchivo === "picker" || rutaArchivo === "dialog") {
     await onProgress?.("Abriendo selector nativo de archivos en el sistema...");
     const picked = await pickNativeFile();
@@ -159,7 +168,7 @@ export async function guardarBorradorTarea(
     throw new Error("Debés especificar al menos 'rutaArchivo' o 'textoEnLinea' para guardar el borrador.");
   }
 
-  await onProgress?.("Inspeccionando estado de la tarea en EVA Moodle...");
+  await onProgress?.("Inspeccionando estado de la tarea en EVA...");
   // 1. Inspeccionar estado de la tarea en Moodle antes de pedir confirmación
   const viewRes = await evaFetch(`/mod/assign/view.php?id=${cmid}`);
   const viewHtml = await viewRes.text();
@@ -170,12 +179,12 @@ export async function guardarBorradorTarea(
     $view("h1, h2, .page-header-headings h1").first().text().replace(/\s+/g, " ").trim() ||
     `Tarea cmid #${cmid}`;
   const nombreCurso =
-    $view(".breadcrumb li:nth-last-child(2) a").text().trim() ||
-    $view(".breadcrumb").text().replace(/\s+/g, " ").trim() ||
+    sanitizeDialogText($view(".breadcrumb li:nth-last-child(2) a").text(), 100, false) ||
+    sanitizeDialogText($view(".breadcrumb").text(), 100, false) ||
     "Curso Moodle";
   const fechaVencimiento =
-    $view("tr:contains('Fecha de entrega'), tr:contains('Due date')").find("td").first().text().trim() ||
-    $view("[data-region='activity-dates'], .activity-dates").text().replace(/\s+/g, " ").trim().slice(0, 120) ||
+    sanitizeDialogText($view("tr:contains('Fecha de entrega'), tr:contains('Due date')").find("td").first().text(), 120, false) ||
+    sanitizeDialogText($view("[data-region='activity-dates'], .activity-dates").text(), 120, false) ||
     undefined;
 
   // Límite estricto de texto para garantizar que quepa completo y sin truncar en el diálogo (máx 350)
@@ -303,7 +312,7 @@ export async function guardarBorradorTarea(
   }
 
   try {
-    await onProgress?.("Subiendo archivo y guardando borrador en EVA Moodle...");
+    await onProgress?.("Subiendo archivo y guardando borrador en EVA...");
     // Subir archivo a la zona de draft de Moodle si se especificó rutaArchivo
     if (rutaArchivo && draftItemMatch) {
       const targetFile = validatedFilePath || rutaArchivo;
@@ -373,7 +382,9 @@ export async function guardarBorradorTarea(
     }
 
     // Serializar inputs del formulario de Moodle mediante helper puro compartido
-    const postBody = buildSaveSubmissionFormData(formHtml, cmid, sesskey, draftItemMatch, textoClean || textoEnLinea);
+    // Se envía exactamente lo mostrado en el diálogo (textoClean); nunca el texto crudo
+    const postBody = buildSaveSubmissionFormData(formHtml, cmid, sesskey, draftItemMatch, textoClean);
+    const noRetry = ` NO reintentes automáticamente: verificá primero el estado actual de la tarea en https://eva.uca.edu.ar/mod/assign/view.php?id=${cmid} (el guardado pudo haberse aplicado igual).`;
 
     const saveRes = await evaFetch(`/mod/assign/view.php?id=${cmid}`, {
       method: "POST",
@@ -384,7 +395,7 @@ export async function guardarBorradorTarea(
     });
 
     if (!saveRes.ok) {
-      throw new Error(`Error HTTP ${saveRes.status} al guardar la entrega en Moodle.`);
+      throw new Error(`Error HTTP ${saveRes.status} al guardar la entrega en Moodle.${noRetry}`);
     }
 
     // Si Moodle rechaza el guardado por validación, re-renderiza el formulario con HTTP 200 en saveRes
@@ -392,7 +403,7 @@ export async function guardarBorradorTarea(
     const $save = cheerio.load(saveHtml);
     const saveErr = $save(".alert-danger, .errormessage, .notifyproblem, .invalid-feedback, .form-control-feedback").text().trim();
     if (saveErr || saveHtml.includes("_qf__mod_assign_submission_form")) {
-      throw new Error(`Moodle rechazó el guardado de la entrega: ${saveErr || "el formulario de entrega volvió a mostrarse con errores de validación"}`);
+      throw new Error(`Moodle rechazó el guardado de la entrega: ${saveErr || "el formulario de entrega volvió a mostrarse con errores de validación"}.${noRetry}`);
     }
 
     // Verificación post-guardado
@@ -402,7 +413,7 @@ export async function guardarBorradorTarea(
 
     const hasError = $check(".alert-danger, .errormessage, .notifyproblem").text().trim();
     if (hasError) {
-      throw new Error(`Moodle rechazó el guardado de la entrega: ${hasError}`);
+      throw new Error(`Moodle rechazó el guardado de la entrega: ${hasError}.${noRetry}`);
     }
 
     // El estado real se lee de la página tras guardar: "Enviado para calificar" = entrega definitiva; "Borrador" = falta confirmar el envío
@@ -424,7 +435,7 @@ export async function guardarBorradorTarea(
           exito: false,
           aprobado: true,
           mensaje: `Estado desconocido: La solicitud de guardado de entrega fue enviada pero el archivo '${baseName}' no pudo ser verificado en el resumen de la tarea #${cmid}. NO reintentes el guardado de inmediato para evitar sobrescrituras. Verificá en el aula virtual: https://eva.uca.edu.ar/mod/assign/view.php?id=${cmid}`,
-          instruccion: "NO reintentes inmediatamente. Verificá en EVA Moodle antes de volver a enviar.",
+          instruccion: "NO reintentes inmediatamente. Verificá en EVA antes de volver a enviar.",
           detalles: {
             cmid,
             archivo: baseName,
@@ -445,8 +456,8 @@ export async function guardarBorradorTarea(
     return {
       exito: true,
       mensaje: esEntregaDefinitiva
-        ? `Entrega guardada exitosamente en EVA Moodle para la tarea #${cmid} (entrega definitiva registrada).`
-        : `Borrador guardado exitosamente en EVA Moodle para la tarea #${cmid}.`,
+        ? `Entrega guardada exitosamente en EVA para la tarea #${cmid} (entrega definitiva registrada).`
+        : `Borrador guardado exitosamente en EVA para la tarea #${cmid}.`,
       detalles: {
         cmid,
         archivo: rutaArchivo ? path.basename(rutaArchivo) : null,
@@ -513,7 +524,7 @@ export async function responderForo(
     throw new Error("El mensaje contiene formato o caracteres no permitidos (dobles espacios, tabulaciones, saltos de línea excesivos o caracteres de control).");
   }
 
-  await onProgress?.("Identificando hilo de discusión en EVA Moodle...");
+  await onProgress?.("Identificando hilo de discusión en EVA...");
   // Obtener la discusión para extraer el postid del mensaje principal, el asunto y nombres legibles
   const discRes = await evaFetch(`/mod/forum/discuss.php?d=${discusionId}`);
   const discHtml = await discRes.text();
@@ -568,6 +579,7 @@ export async function responderForo(
 
   try {
     const postBody = buildForumReplyFormData(replyHtml, replySubject, msgClean);
+    const noRetryForo = ` NO reintentes automáticamente: verificá primero en https://eva.uca.edu.ar/mod/forum/discuss.php?d=${discusionId} si tu respuesta ya se publicó (puede haberse aplicado igual).`;
 
     const postRes = await evaFetch("/mod/forum/post.php", {
       method: "POST",
@@ -575,7 +587,7 @@ export async function responderForo(
       body: postBody.toString()
     });
     if (!postRes.ok) {
-      throw new Error(`Error HTTP ${postRes.status} al publicar la respuesta en el foro.`);
+      throw new Error(`Error HTTP ${postRes.status} al publicar la respuesta en el foro.${noRetryForo}`);
     }
 
     // Éxito = Moodle redirige a la discusión; si re-muestra el formulario, rechazó el envío
@@ -583,7 +595,7 @@ export async function responderForo(
     const $post = cheerio.load(postHtml);
     if ($post("form#mformforum").length > 0 || /_qf__mod_forum_post_form/.test(postHtml)) {
       const err = $post(".alert-danger, .errormessage, .invalid-feedback, .form-control-feedback").text().replace(/\s+/g, " ").trim();
-      throw new Error(`Moodle rechazó la respuesta del foro: ${err || "el formulario volvió a mostrarse con errores de validación"}`);
+      throw new Error(`Moodle rechazó la respuesta del foro: ${err || "el formulario volvió a mostrarse con errores de validación"}.${noRetryForo}`);
     }
     clearEvaCache();
 

@@ -26,6 +26,8 @@ export interface SessionData {
   carreraActiva?: string;
   carrerasDisponibles?: Array<{ id: string; nombre: string }>;
   evaMaterias?: Array<{ id: number; nombre: string; codigo?: string; url: string }>;
+  // Materias que cursa actualmente según Guaraní, por carrera (clave normalizada). Cifrado junto con la sesión.
+  materiasEnCurso?: Record<string, { savedAt: number; items: Array<{ codigo?: string; nombre: string }> }>;
   savedAt: string;
 }
 
@@ -152,6 +154,9 @@ let lastMtime = 0;
 // Guarda la sesión cifrada con AES-256-GCM de forma atómica y serializada entre procesos
 // Solo audita si shouldAudit=true (ej. inicios de sesión formal), previniendo saturación de audit.log
 export function saveEncryptedSession(data: SessionData, shouldAudit = false): void {
+  // Si cambia el usuario (nuevo login sin logout previo), invalidar cachés en memoria para no mezclar datos
+  const prevEmail = cachedSession?.userEmail;
+  const userChanged = Boolean(prevEmail && data.userEmail && prevEmail.toLowerCase() !== data.userEmail.toLowerCase());
   if (!fs.existsSync(CONFIG.BASE_DIR)) {
     fs.mkdirSync(CONFIG.BASE_DIR, { recursive: true, mode: 0o700 });
   }
@@ -201,6 +206,7 @@ export function saveEncryptedSession(data: SessionData, shouldAudit = false): vo
     if (shouldAudit) {
       logger.audit("session_saved", { userEmail: data.userEmail });
     }
+    if (userChanged) runPurgeHooks();
   } finally {
     if (acquired) {
       releaseLock(sessionLockPath);
@@ -263,6 +269,21 @@ export function registerSessionPurgeHook(hook: () => void): void {
   sessionPurgeHooks.push(hook);
 }
 
+function runPurgeHooks(): void {
+  for (const hook of sessionPurgeHooks) {
+    try {
+      hook();
+    } catch {}
+  }
+}
+
+// Clave corta y estable (hash) del usuario de la sesión, para nombrar archivos de caché por usuario sin exponer el email
+export function getSessionUserKey(session?: SessionData | null): string {
+  const s = session ?? loadEncryptedSession();
+  const id = (s?.userEmail || s?.userName || "anon").toLowerCase().trim();
+  return crypto.createHash("sha256").update(id).digest("hex").slice(0, 16);
+}
+
 // Purga local completa de sesión
 export function clearSession(): void {
   if (cookieSaveTimeout) {
@@ -278,11 +299,7 @@ export function clearSession(): void {
   clearCachedMasterKey();
 
   // Invalidar cachés en memoria de plataformas y purgar CACHE_DIR
-  for (const hook of sessionPurgeHooks) {
-    try {
-      hook();
-    } catch {}
-  }
+  runPurgeHooks();
   if (fs.existsSync(CONFIG.CACHE_DIR)) {
     try {
       for (const file of fs.readdirSync(CONFIG.CACHE_DIR)) {

@@ -129,11 +129,31 @@ export interface PdfExtractResult {
   proximaPagina?: number;
 }
 
+const PDF_TIMEOUT_MS = 45000;
+const MAX_IMAGE_PIXELS = 25_000_000;
+const MAX_PAGES_LIMIT = 50;
+
+// Carrera contra un plazo global; si vence, lanza un error claro en español
+function withDeadline<T>(p: Promise<T>, deadline: number): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error("La lectura del PDF tardó demasiado (más de 45 segundos). Probá con menos páginas o un archivo más liviano."));
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("La lectura del PDF tardó demasiado (más de 45 segundos). Probá con menos páginas o un archivo más liviano.")),
+      remaining
+    );
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
 export async function extractPdfContent(
   buffer: Uint8Array,
   desdePagina = 1,
   maxPages = 15
 ): Promise<PdfExtractResult> {
+  const deadline = Date.now() + PDF_TIMEOUT_MS;
+  maxPages = Math.min(Math.max(1, Math.floor(maxPages) || 15), MAX_PAGES_LIMIT);
   const pdfjsLib = await getPdfJs();
   const loadingTask = pdfjsLib.getDocument({
     data: buffer.slice(),
@@ -143,7 +163,23 @@ export async function extractPdfContent(
     standardFontDataUrl
   });
 
-  const doc = await loadingTask.promise;
+  let doc: any;
+  try {
+    doc = await withDeadline(loadingTask.promise, deadline);
+  } catch (err: any) {
+    try { void loadingTask.destroy(); } catch {}
+    if (err?.name === "PasswordException") {
+      throw new Error("El PDF está protegido con contraseña y no se puede leer.");
+    }
+    if (err?.name === "InvalidPDFException") {
+      throw new Error("El archivo no es un PDF válido o está dañado.");
+    }
+    throw err;
+  }
+  if (desdePagina > doc.numPages) {
+    try { await doc.destroy(); } catch {}
+    throw new Error(`El PDF tiene solo ${doc.numPages} páginas; pediste desde la página ${desdePagina}.`);
+  }
   const blocks: ExtractedBlock[] = [];
   const MAX_IMAGES_TOTAL = 10;
   let totalImagesExtracted = 0;
@@ -156,8 +192,8 @@ export async function extractPdfContent(
     let aggregateImageBytes = 0;
 
     for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
-      const page = await doc.getPage(pageNum);
-      const textContent = await page.getTextContent();
+      const page = await withDeadline<any>(doc.getPage(pageNum), deadline);
+      const textContent = await withDeadline<any>(page.getTextContent(), deadline);
       const pageText = (textContent.items as Array<{ str?: string; hasEOL?: boolean }>)
         .map((item) => (item.str || "") + (item.hasEOL ? "\n" : " "))
         .join("")
@@ -174,17 +210,19 @@ export async function extractPdfContent(
 
       if (pageText.length <= 30) {
         // Posible página escaneada o con figuras: extraer imágenes de la página
-        const ops = await page.getOperatorList();
+        const ops = await withDeadline<any>(page.getOperatorList(), deadline);
         let foundImage = false;
 
         for (let i = 0; i < ops.fnArray.length; i++) {
           if (totalImagesExtracted >= MAX_IMAGES_TOTAL) break;
 
-          if (ops.fnArray[i] === pdfjsLib.OPS.paintImageXObject) {
+          const opCode = ops.fnArray[i];
+          const isInline = opCode === pdfjsLib.OPS.paintInlineImageXObject;
+          if (opCode === pdfjsLib.OPS.paintImageXObject || isInline) {
             const imgName = ops.argsArray[i][0];
             try {
               // Obtener objeto de forma asíncrona segura con timeout de 5s para evitar cuelgues
-              const imgObj = await new Promise<any>((resolve) => {
+              const imgObj = isInline ? imgName : await new Promise<any>((resolve) => {
                 const timer = setTimeout(() => resolve(null), 5000);
                 try {
                   let direct: any;
@@ -207,6 +245,15 @@ export async function extractPdfContent(
               });
 
               if (imgObj && imgObj.data && imgObj.width && imgObj.height) {
+                if (imgObj.width * imgObj.height > MAX_IMAGE_PIXELS) {
+                  blocks.push({
+                    type: "text",
+                    text: `--- Página ${pageNum} de ${doc.numPages} ---
+[Imagen omitida: demasiado grande (${imgObj.width}x${imgObj.height} px)]`
+                  });
+                  foundImage = true;
+                  continue;
+                }
                 // 1. Passthrough directo si los bytes crudos ya corresponden a JPEG estándar
                 if (
                   imgObj.data.length > 3 &&

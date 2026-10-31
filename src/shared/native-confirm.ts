@@ -226,10 +226,7 @@ export function resetConfirmationCooldown(): void {
 }
 
 // Despliega un diálogo modal nativo del sistema operativo (Canal B) o Canal A si está disponible
-export async function showNativeConfirmation(
-  details: ConfirmDetails,
-  onHeartbeat?: (tick?: number) => void | Promise<void>
-): Promise<boolean> {
+function assertPromptAllowed(): void {
   const now = Date.now();
 
   // Cooldown tras rechazo previo para prevenir ataques de fatiga
@@ -250,6 +247,14 @@ export async function showNativeConfirmation(
       `Límite de seguridad alcanzado: se excedió el máximo de ${MAX_PROMPTS_PER_HOUR} confirmaciones nativas por hora.`
     );
   }
+}
+
+export async function showNativeConfirmation(
+  details: ConfirmDetails,
+  onHeartbeat?: (tick?: number) => void | Promise<void>
+): Promise<boolean> {
+  // Chequeo rápido antes de encolar
+  assertPromptAllowed();
 
   // Verificación estricta de longitud: si el detalle excede la capacidad visual del diálogo, rechazar (fail-closed)
   if (details.detalle.length > 800) {
@@ -260,6 +265,8 @@ export async function showNativeConfirmation(
 
   // Serialización: solo un diálogo activo a la vez
   const run = async (): Promise<boolean> => {
+    // Reevaluar dentro de la cola: si el primer diálogo fue rechazado, los siguientes se cortan acá
+    assertPromptAllowed();
     promptHistory.push(Date.now());
 
     let tickCount = 0;
@@ -417,13 +424,20 @@ async function spawnPlatformDialog(details: ConfirmDetails): Promise<DialogOutco
       end run
     `;
     return new Promise((resolve) => {
-      execFile("osascript", ["-e", script, title, body], { timeout: 46000 }, (error, stdout) => {
+      execFile("osascript", ["-e", script, title, body], { timeout: 46000 }, (error, stdout, stderr) => {
         if (!error && stdout) {
           if (stdout.includes("OK")) return resolve("approved");
           if (stdout.includes("TIMEOUT")) return resolve("timeout");
+          if (stdout.includes("DENIED")) return resolve("denied");
         }
-        if (error && (error as any).code === "ENOENT") return resolve("unavailable");
-        resolve("denied");
+        if (error) {
+          if ((error as any).code === "ENOENT") return resolve("unavailable");
+          if (error.killed) return resolve("timeout");
+          // Rechazo real: el botón Cancelar de display dialog lanza el error -128 "User canceled"
+          if (/-128|user canceled|user cancelled/i.test(String(stderr || ""))) return resolve("denied");
+        }
+        // Cualquier otro fallo (sin sesión gráfica, permisos, etc.) no es un rechazo del usuario
+        resolve("unavailable");
       });
     });
   } else {
@@ -432,35 +446,40 @@ async function spawnPlatformDialog(details: ConfirmDetails): Promise<DialogOutco
       return "unavailable";
     }
 
-    const tryExec = (cmd: string, args: string[], timeoutCode?: number): Promise<DialogOutcome> => {
+    // deniedCodes: códigos de salida que representan un rechazo real del usuario; el resto (sin GUI, etc.) es "unavailable"
+    const tryExec = (cmd: string, args: string[], deniedCodes: number[], timeoutCode?: number): Promise<DialogOutcome> => {
       return new Promise((resolve) => {
         execFile(cmd, args, { timeout: 46000 }, (error) => {
           if (!error) return resolve("approved");
-          if ((error as any).code === "ENOENT") return resolve("unavailable");
-          if (error.killed || (timeoutCode !== undefined && (error as any).code === timeoutCode)) {
+          const code = (error as any).code;
+          if (code === "ENOENT") return resolve("unavailable");
+          if (error.killed || (timeoutCode !== undefined && code === timeoutCode)) {
             return resolve("timeout");
           }
-          return resolve("denied");
+          if (typeof code === "number" && deniedCodes.includes(code)) return resolve("denied");
+          return resolve("unavailable");
         });
       });
     };
 
-    // 1. Probar zenity
+    // 1. Probar zenity (1 = No/cerrar, 5 = timeout)
     const zenityRes = await tryExec(
       "zenity",
       ["--question", "--title", title, "--text", body, "--timeout=45", "--no-markup"],
+      [1],
       5
     );
     if (zenityRes !== "unavailable") return zenityRes;
 
-    // 2. Probar kdialog (KDE)
-    const kdialogRes = await tryExec("kdialog", ["--title", title, "--yesno", body]);
+    // 2. Probar kdialog (KDE): 1 = No, 2 = Cancelar
+    const kdialogRes = await tryExec("kdialog", ["--title", title, "--yesno", body], [1, 2]);
     if (kdialogRes !== "unavailable") return kdialogRes;
 
-    // 3. Probar yad
+    // 3. Probar yad: 1 = Cancelar, 252 = ventana cerrada, 70 = timeout
     const yadRes = await tryExec(
       "yad",
       ["--question", "--title", title, "--text", body, "--timeout=45", "--no-markup", "--button=Cancelar:1", "--button=Confirmar:0"],
+      [1, 252],
       70
     );
     return yadRes;
@@ -479,6 +498,8 @@ export async function pickNativeFile(): Promise<string> {
     );
     const script = `
       try {
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
         Add-Type -AssemblyName System.Windows.Forms | Out-Null
         $f = New-Object System.Windows.Forms.OpenFileDialog
         $f.Title = "Seleccionar archivo para entrega en EVA UCA"
@@ -494,9 +515,10 @@ export async function pickNativeFile(): Promise<string> {
       execFile(
         sysPowerShell,
         ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-        { timeout: 60000 },
+        { timeout: 60000, encoding: "utf8" },
         (error, stdout) => {
-          resolve(!error && stdout.trim() ? stdout.trim() : "");
+          const out = String(stdout || "").replace(/^﻿/, "").trim();
+          resolve(!error && out ? out : "");
         }
       );
     });

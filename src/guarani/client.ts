@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { ttlCached } from "../shared/ttl-cache.js";
 import path from "node:path";
 import * as cheerio from "cheerio";
-import { guaraniFetch, guaraniMutex } from "../shared/http.js";
+import { guaraniFetch, guaraniMutex, GuaraniSessionExpiredError, SessionExpiredError } from "../shared/http.js";
 import { logger } from "../shared/logger.js";
 import { loadEncryptedSession, saveEncryptedSession, registerSessionPurgeHook } from "../auth/session.js";
 import { withInterProcessLock } from "../auth/session-store.js";
@@ -52,13 +52,27 @@ export interface CursadaInfo {
 }
 
 export function calcularFaltas(porcentajeAsistencia: number, inasistencias: number): CalculoFaltas {
-  if (inasistencias <= 0 || porcentajeAsistencia >= 100) {
+  if (inasistencias <= 0 && porcentajeAsistencia >= 100) {
     return {
       porcentajeAsistencia: 100,
       inasistenciasTotales: 0,
       estadoAsistencia: "Sin faltas registradas",
       mensajeCalculo:
         "No registrás inasistencias en esta materia (100% de asistencia). Al no haber faltas computadas en Guaraní, no se puede calcular con exactitud cuántas faltas restan hasta quedar libre porque se desconoce el porcentaje que descuenta cada clase en esta comisión."
+    };
+  }
+
+  // Sin detalle de faltas (o con 100% pero faltas anotadas): se respeta el porcentaje que informa Guaraní
+  if (inasistencias <= 0 || porcentajeAsistencia >= 100) {
+    const pct = Number.isFinite(porcentajeAsistencia) ? porcentajeAsistencia : 100;
+    const libre = pct < 75;
+    return {
+      porcentajeAsistencia: pct,
+      inasistenciasTotales: Math.max(0, inasistencias),
+      estadoAsistencia: libre ? "Libre" : "Normal",
+      mensajeCalculo: libre
+        ? `Guaraní informa ${pct}% de asistencia (por debajo del 75% requerido: condición LIBRE). El detalle de las faltas no está disponible, así que no se puede estimar cuántas clases restan.`
+        : `Guaraní informa ${pct}% de asistencia. El detalle de las faltas no está disponible, así que no se puede estimar cuántas faltas restan hasta quedar libre (<75%).`
     };
   }
 
@@ -176,6 +190,14 @@ export interface PlanEstudiosInfo {
   materiasHabilitadasParaCursar?: MateriaPlan[];
 }
 
+// Extrae los argumentos de kernel.renderer.on_arrival(...). Primero con el patrón anclado a `);</script>`
+// (no se corta en un `);` dentro del contenido); si no hay coincidencias, cae al patrón perezoso.
+export function extractOnArrivalPayloads(text: string): string[] {
+  const anchored = [...text.matchAll(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);\s*<\/script>/g)];
+  if (anchored.length > 0) return anchored.map((m) => m[1]);
+  return [...text.matchAll(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/g)].map((m) => m[1]);
+}
+
 // Desenvuelve respuestas de Guaraní Chulupi (JSON con propiedad {cont} o scripts de renderizado on_arrival)
 export function unwrapChulupiHtml(rawText: string): string {
   let text = rawText;
@@ -184,17 +206,16 @@ export function unwrapChulupiHtml(rawText: string): string {
     if (j && typeof j.cont === "string") text = j.cont;
   } catch {}
 
-  const matches = [...text.matchAll(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/g)];
+  const matches = extractOnArrivalPayloads(text);
   if (matches.length > 0) {
     const contents: string[] = [];
     for (const match of matches) {
       try {
-        const raw = match[1];
-        const parsed = JSON.parse(raw);
+        const parsed = JSON.parse(match);
         if (parsed?.content) contents.push(parsed.content);
       } catch {
         try {
-          const unescaped = match[1]
+          const unescaped = match
             .replace(/\\"/g, '"')
             .replace(/\\'/g, "'")
             .replace(/\\\\/g, "\\");
@@ -289,6 +310,33 @@ export interface InasistenciasMateriaParsed {
   detalles: InasistenciaDetalle[];
 }
 
+function parseCantidadFaltas(raw: string): number {
+  const m = /(\d+(?:[.,]\d+)?)/.exec(raw);
+  if (!m) return 1;
+  const n = parseFloat(m[1].replace(",", "."));
+  return Number.isFinite(n) && n >= 0 ? n : 1;
+}
+
+export interface ReporteInasistenciasResult {
+  items: InasistenciasMateriaParsed[];
+  // false cuando el HTML no tiene la estructura esperada (no se pudo leer): NO equivale a "sin faltas"
+  estructuraValida: boolean;
+}
+
+// Parser puro para reporte de inasistencias de SIU Guaraní (distingue "sin faltas" de "no se pudo leer")
+export function parseReporteInasistenciasDetallado(html: string): ReporteInasistenciasResult {
+  const $ = cheerio.load(html);
+  const items = parseReporteInasistencias(html);
+  let estructuraValida = $(".actividad").length > 0;
+  if (!estructuraValida) {
+    const texto = $("body").text().replace(/\s+/g, " ");
+    const vacio = /no\s+(?:se\s+)?(?:registr|hay|posee|tiene|encontr)\w*[^.]{0,80}inasistencia|sin\s+inasistencias/i.test(texto);
+    const titulo = $("h1, h2, h3, h4, .page-header, .titulo, title").text();
+    estructuraValida = vacio || /inasistencia/i.test(titulo);
+  }
+  return { items, estructuraValida };
+}
+
 // Parser puro para reporte de inasistencias de SIU Guaraní
 export function parseReporteInasistencias(html: string): InasistenciasMateriaParsed[] {
   const $ = cheerio.load(html);
@@ -316,7 +364,7 @@ export function parseReporteInasistencias(html: string): InasistenciasMateriaPar
         const tipoClase = tds.eq(1).text().trim() || "Teórico";
         const tema = tds.eq(2).text().trim() || undefined;
         const cantStr = tds.eq(3).text().trim();
-        const cant = parseFloat(cantStr) || 1;
+        const cant = parseCantidadFaltas(cantStr);
         const justStr = tds.eq(4).text().trim().toLowerCase();
         const justificada = justStr === "si" || justStr === "sí";
 
@@ -355,14 +403,14 @@ export function parseCalendarioAsignaciones(rawText: string): CursadaInfo[] {
       const j = JSON.parse(rawText);
       if (typeof j?.cont === "string") cont = j.cont;
     } catch {}
-    const match =
-      cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);\s*<\/script>/) ||
-      cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/);
-    if (match) {
-      const data = JSON.parse(match[1]);
-      if (Array.isArray(data?.info?.asignaciones)) {
-        asignaciones = data.info.asignaciones;
-      }
+    for (const payload of extractOnArrivalPayloads(cont)) {
+      try {
+        const data = JSON.parse(payload);
+        if (Array.isArray(data?.info?.asignaciones)) {
+          asignaciones = data.info.asignaciones;
+          break;
+        }
+      } catch {}
     }
   } catch {}
 
@@ -561,6 +609,16 @@ export function normalizeMateria(name: string): string {
     .trim();
 }
 
+// Búsqueda por nombre: igualdad exacta normalizada primero; subconjunto de palabras solo si es único e inequívoco
+export function findMateriaUnica<T>(items: T[], getNombre: (x: T) => string, target: string): T | undefined {
+  const normTarget = normalizeMateria(target);
+  if (!normTarget) return undefined;
+  const exact = items.filter((x) => normalizeMateria(getNombre(x)) === normTarget);
+  if (exact.length >= 1) return exact[0];
+  const parciales = items.filter((x) => matchMateriaFilter(getNombre(x), target));
+  return parciales.length === 1 ? parciales[0] : undefined;
+}
+
 export function matchMateriaFilter(matNombre: string, targetMateria: string): boolean {
   const normMat = normalizeMateria(matNombre);
   const normTarget = normalizeMateria(targetMateria);
@@ -584,7 +642,10 @@ export function matchMateria(
   if (codeA && codeB) {
     return codeA.trim().toLowerCase() === codeB.trim().toLowerCase();
   }
-  return matchMateriaFilter(nameA || "", nameB || "");
+  // Sin códigos: solo igualdad normalizada exacta ("Derecho Civil" no debe coincidir con "Derecho Civil II")
+  const a = normalizeMateria(nameA || "");
+  const b = normalizeMateria(nameB || "");
+  return a !== "" && a === b;
 }
 
 // Parser puro para mesas de examen disponibles
@@ -633,6 +694,13 @@ export function parseMesasExamen(html: string, targetMateria = ""): MesaExamenIn
       inscripcionAbierta
     });
   });
+
+  // Si hay mesas cuyo nombre coincide exactamente con lo pedido, descartar las de materias parecidas ("Civil II")
+  if (targetMateria) {
+    const normT = normalizeMateria(targetMateria);
+    const exactas = mesas.filter((m) => normalizeMateria(m.materia) === normT);
+    if (exactas.length > 0) return exactas;
+  }
 
   return mesas;
 }
@@ -693,11 +761,46 @@ function normalizeCareer(str: string): string {
 }
 
 let carreraActivaVerificada: { nombre: string; checkedAt: number } | null = null;
+const CARRERA_FASTPATH_MS = 2 * 60 * 1000;
 
 export function clearCarreraActivaCache(): void {
   carreraActivaVerificada = null;
 }
 registerSessionPurgeHook(clearCarreraActivaCache);
+
+// Carrera activa verificada hace poco. Además de la edad, se compara con session.carreraActiva (compartida entre
+// procesos): si otro proceso cambió de carrera, difiere y se fuerza la verificación real contra el servidor.
+function carreraActivaRapida(): string | undefined {
+  const v = carreraActivaVerificada;
+  if (!v || Date.now() - v.checkedAt >= CARRERA_FASTPATH_MS) return undefined;
+  const persistida = loadEncryptedSession()?.carreraActiva;
+  if (persistida && normalizeCareer(persistida) !== normalizeCareer(v.nombre)) return undefined;
+  return v.nombre;
+}
+
+// Clave de caché normalizada de la carrera (minúsculas, sin tildes). Sin carrera indicada usa la activa real
+// verificada; si aún no se conoce devuelve undefined (no se debe leer caché con una clave ambigua).
+function resolveCareerKey(carrera?: string): string | undefined {
+  if (carrera) {
+    const disp = loadEncryptedSession()?.carrerasDisponibles ?? [];
+    const norm = normalizeCareer(carrera);
+    const kws = norm.split(" ").filter((w) => w.length > 2);
+    const m = disp.find((c) => {
+      if (c.id === carrera) return true;
+      const n = normalizeCareer(c.nombre);
+      return n.includes(norm) || (kws.length > 0 && kws.every((k) => n.includes(k)));
+    });
+    return normalizeCareer(m ? m.nombre : carrera);
+  }
+  const activa = carreraActivaRapida();
+  return activa ? normalizeCareer(activa) : undefined;
+}
+
+// Clave + force para ttlCached: si no se conoce la carrera activa se fuerza la consulta (no se lee caché ambigua)
+function ttlCarreraKey(carrera?: string): { key: string; force: boolean } {
+  const k = resolveCareerKey(carrera);
+  return { key: k ?? "?", force: k === undefined };
+}
 
 // Descubre carreras disponibles en Guaraní, descarta cursos auxiliares y conmuta a la carrera académica objetivo
 export async function ensureCarreraActiva(
@@ -713,15 +816,16 @@ export async function ensureCarreraActiva(
     disponibles = [];
   }
 
-  // Fast path para consultas de lectura si la carrera fue verificada recientemente (< 5 min)
-  if (!forceStrict && carreraActivaVerificada && (Date.now() - carreraActivaVerificada.checkedAt < 5 * 60 * 1000)) {
+  // Fast path para consultas de lectura si la carrera fue verificada recientemente (< 2 min y coherente con la sesión)
+  const activaRapida = !forceStrict ? carreraActivaRapida() : undefined;
+  if (activaRapida) {
     if (!targetCarrera) {
-      return { activa: carreraActivaVerificada.nombre, disponibles: disponibles.map((c) => c.nombre) };
+      return { activa: activaRapida, disponibles: disponibles.map((c) => c.nombre) };
     }
     const normTarget = normalizeCareer(targetCarrera);
-    const normActive = normalizeCareer(carreraActivaVerificada.nombre);
+    const normActive = normalizeCareer(activaRapida);
     if (normTarget === normActive || normActive.includes(normTarget)) {
-      return { activa: carreraActivaVerificada.nombre, disponibles: disponibles.map((c) => c.nombre) };
+      return { activa: activaRapida, disponibles: disponibles.map((c) => c.nombre) };
     }
   }
 
@@ -796,13 +900,18 @@ export async function ensureCarreraActiva(
       const verifyHtml = await readGuaraniText(verifyRes);
       const activeFromHtml = extractActiveCareerFromHtml(verifyHtml);
       const $verify = cheerio.load(verifyHtml);
+      // Se compara el id por atributo (sin interpolarlo en el selector) para evitar inyección de selectores
       const activeIdMatch =
-        $verify(
-          `a.js-select-carreras[data-carrera-id="${targetId}"].active, ` +
-          `a.js-select-carreras[data-carrera-id="${targetId}"].selected, ` +
-          `a.js-select-carreras[data-carrera-id="${targetId}"][data-carrera-selected="1"], ` +
-          `li.active a.js-select-carreras[data-carrera-id="${targetId}"]`
-        ).length > 0;
+        $verify("a.js-select-carreras")
+          .filter((__, a) => {
+            if ($verify(a).attr("data-carrera-id") !== targetId) return false;
+            return (
+              $verify(a).hasClass("active") ||
+              $verify(a).hasClass("selected") ||
+              $verify(a).attr("data-carrera-selected") === "1" ||
+              $verify(a).closest("li.active").length > 0
+            );
+          }).length > 0;
 
       if (activeIdMatch) {
         switchedOk = true;
@@ -879,28 +988,123 @@ export async function ensureCarreraActiva(
 }
 
 const GUARANI_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos de caché en memoria
-const cursadaCache = new Map<string, { data: CursadaInfo[]; expires: number }>();
-const historiaCache = new Map<string, { data: HistoriaAcademicaInfo; expires: number }>();
+const MATERIAS_CURSO_TTL_MS = 12 * 60 * 60 * 1000; // 12 h
+
+interface GuaraniCache<T> {
+  store: Map<string, { data: T; expires: number }>;
+  inflight: Map<string, Promise<T>>;
+}
+interface GuaraniFetched<T> {
+  data: T;
+  cacheable: boolean; // false cuando el resultado es parcial/incierto: no se guarda
+  carreraKey?: string; // clave real (carrera activa resuelta dentro del lock)
+}
+
+const cursadaCache: GuaraniCache<CursadaInfo[]> = { store: new Map(), inflight: new Map() };
+const historiaCache: GuaraniCache<HistoriaAcademicaInfo> = { store: new Map(), inflight: new Map() };
+const materiasCursoMem = new Map<string, { at: number; items: Array<{ codigo?: string; nombre: string }> }>();
+// Generación: se incrementa al limpiar; una consulta en vuelo que termina después NO escribe en la caché
+let cacheGeneration = 0;
 
 export function clearGuaraniCache(): void {
-  cursadaCache.clear();
-  historiaCache.clear();
+  cacheGeneration++;
+  cursadaCache.store.clear();
+  cursadaCache.inflight.clear();
+  historiaCache.store.clear();
+  historiaCache.inflight.clear();
+  materiasCursoMem.clear();
 }
 registerSessionPurgeHook(clearGuaraniCache);
 
-// 1. Obtener estado de cursadas activas e inasistencias acumuladas
-export async function getEstadoCursada(carrera?: string, forzarRefresco = false): Promise<CursadaInfo[]> {
-  const cacheKey = (carrera || "default").toLowerCase();
-  if (!forzarRefresco) {
-    const cached = cursadaCache.get(cacheKey);
-    if (cached && Date.now() < cached.expires) {
-      return cached.data;
+// Caché por carrera (clave normalizada y resuelta) con deduplicación de consultas simultáneas
+async function viaCache<T>(
+  c: GuaraniCache<T>,
+  carrera: string | undefined,
+  forzar: boolean,
+  run: () => Promise<GuaraniFetched<T>>,
+  afterStore?: (key: string, data: T) => void
+): Promise<T> {
+  const key = resolveCareerKey(carrera);
+  if (!forzar && key) {
+    const hit = c.store.get(key);
+    if (hit && Date.now() < hit.expires) return hit.data;
+    const pend = c.inflight.get(key);
+    if (pend) return pend;
+  }
+  const gen = cacheGeneration;
+  const p: Promise<T> = run()
+    .then((r) => {
+      const wkey = r.carreraKey ?? key;
+      if (r.cacheable && wkey && gen === cacheGeneration) {
+        c.store.set(wkey, { data: r.data, expires: Date.now() + GUARANI_CACHE_TTL_MS });
+        afterStore?.(wkey, r.data);
+      }
+      return r.data;
+    })
+    .finally(() => {
+      if (key && c.inflight.get(key) === p) c.inflight.delete(key);
+    });
+  if (key) c.inflight.set(key, p);
+  return p;
+}
+
+// Guarda (memoria + sesión cifrada por usuario) las materias que se cursan actualmente
+function rememberMateriasEnCurso(key: string, cursadas: CursadaInfo[]): void {
+  const vistos = new Set<string>();
+  const items: Array<{ codigo?: string; nombre: string }> = [];
+  for (const c of cursadas) {
+    const k = c.codigo?.toLowerCase() || normalizeMateria(c.materia);
+    if (!c.materia || vistos.has(k)) continue;
+    vistos.add(k);
+    items.push({ codigo: c.codigo || undefined, nombre: c.materia });
+  }
+  if (items.length === 0) return;
+  materiasCursoMem.set(key, { at: Date.now(), items });
+  try {
+    const sess = loadEncryptedSession();
+    if (!sess) return;
+    const prev = sess.materiasEnCurso?.[key];
+    if (prev && Date.now() - prev.savedAt < 60 * 60 * 1000 && JSON.stringify(prev.items) === JSON.stringify(items)) return;
+    sess.materiasEnCurso = { ...(sess.materiasEnCurso || {}), [key]: { savedAt: Date.now(), items } };
+    saveEncryptedSession(sess);
+  } catch {}
+}
+
+// Materias que el alumno cursa ACTUALMENTE según Guaraní. Usa caché en memoria y en la sesión cifrada (TTL 12 h):
+// si hay datos vigentes responde sin red.
+export async function getMateriasEnCurso(): Promise<Array<{ codigo?: string; nombre: string }>> {
+  const sess = loadEncryptedSession();
+  const key = resolveCareerKey(undefined) ?? (sess?.carreraActiva ? normalizeCareer(sess.carreraActiva) : undefined);
+  if (key) {
+    const mem = materiasCursoMem.get(key);
+    if (mem && Date.now() - mem.at < MATERIAS_CURSO_TTL_MS) return mem.items;
+    const persisted = sess?.materiasEnCurso?.[key];
+    if (persisted && Date.now() - persisted.savedAt < MATERIAS_CURSO_TTL_MS) {
+      materiasCursoMem.set(key, { at: persisted.savedAt, items: persisted.items });
+      return persisted.items;
     }
   }
+  const cursadas = await getEstadoCursada();
+  const realKey = resolveCareerKey(undefined) ?? key;
+  if (realKey) rememberMateriasEnCurso(realKey, cursadas);
+  return cursadas.map((c) => ({ codigo: c.codigo || undefined, nombre: c.materia }));
+}
 
+// 1. Obtener estado de cursadas activas e inasistencias acumuladas
+export async function getEstadoCursada(carrera?: string, forzarRefresco = false): Promise<CursadaInfo[]> {
+  return viaCache(
+    cursadaCache,
+    carrera,
+    forzarRefresco,
+    () => getEstadoCursadaSinCache(carrera),
+    (key, data) => rememberMateriasEnCurso(key, data)
+  );
+}
+
+async function getEstadoCursadaSinCache(carrera?: string): Promise<GuaraniFetched<CursadaInfo[]>> {
   return withGuaraniLock(async () => {
     try {
-      await ensureCarreraActiva(carrera);
+      const { activa } = await ensureCarreraActiva(carrera);
 
       // 1. Obtener inasistencias y cursadas en paralelo
       const [inasResResult, calResResult] = await Promise.allSettled([
@@ -908,13 +1112,27 @@ export async function getEstadoCursada(carrera?: string, forzarRefresco = false)
         guaraniFetch("/calendario")
       ]);
 
+      // Si ambas consultas fallaron por sesión vencida, avisar en vez de devolver una lista vacía
+      if (inasResResult.status === "rejected" && calResResult.status === "rejected") {
+        const sesion = [inasResResult.reason, calResResult.reason].find(
+          (e) => e instanceof GuaraniSessionExpiredError || e instanceof SessionExpiredError
+        );
+        if (sesion) throw sesion;
+      }
+
       let inasistenciasList: InasistenciasMateriaParsed[] = [];
       let inasistenciasDisponibles = false;
       if (inasResResult.status === "fulfilled") {
         try {
+          if (!inasResResult.value.ok) throw new Error(`HTTP ${inasResResult.value.status}`);
           const inasRaw = await readGuaraniText(inasResResult.value);
-          inasistenciasList = parseReporteInasistencias(unwrapChulupiHtml(inasRaw));
-          inasistenciasDisponibles = true;
+          const det = parseReporteInasistenciasDetallado(unwrapChulupiHtml(inasRaw));
+          if (det.estructuraValida) {
+            inasistenciasList = det.items;
+            inasistenciasDisponibles = true;
+          } else {
+            logger.warn("/reporte_inasistencias devolvió HTML sin la estructura esperada; se omite el cálculo de faltas.");
+          }
         } catch (err) {
           logger.warn(`No se pudo parsear /reporte_inasistencias: ${err}`);
         }
@@ -923,10 +1141,12 @@ export async function getEstadoCursada(carrera?: string, forzarRefresco = false)
       }
 
       let cursadas: CursadaInfo[] = [];
+      let calendarioOk = false;
       if (calResResult.status === "fulfilled") {
         try {
           const calRaw = await readGuaraniText(calResResult.value);
           cursadas = parseCalendarioAsignaciones(calRaw);
+          calendarioOk = calResResult.value.ok;
         } catch (err) {
           logger.warn(`No se pudo parsear /calendario: ${err}`);
         }
@@ -996,10 +1216,9 @@ export async function getEstadoCursada(carrera?: string, forzarRefresco = false)
         }
       }
 
-      if (inasistenciasDisponibles) {
-        cursadaCache.set(cacheKey, { data: cursadas, expires: Date.now() + GUARANI_CACHE_TTL_MS });
-      }
-      return cursadas;
+      // No cachear resultados parciales (reporte ilegible o sin calendario ni cursadas)
+      const cacheable = inasistenciasDisponibles && (calendarioOk || cursadas.length > 0);
+      return { data: cursadas, cacheable, carreraKey: activa ? normalizeCareer(activa) : undefined };
     } catch (err) {
       logger.error("Error al obtener estado de cursada en Guaraní", err);
       throw err;
@@ -1009,14 +1228,10 @@ export async function getEstadoCursada(carrera?: string, forzarRefresco = false)
 
 // 2. Obtener historia académica completa y analítico
 export async function getHistoriaAcademica(carrera?: string, forzarRefresco = false): Promise<HistoriaAcademicaInfo> {
-  const cacheKey = (carrera || "default").toLowerCase();
-  if (!forzarRefresco) {
-    const cached = historiaCache.get(cacheKey);
-    if (cached && Date.now() < cached.expires) {
-      return cached.data;
-    }
-  }
+  return viaCache(historiaCache, carrera, forzarRefresco, () => getHistoriaAcademicaSinCache(carrera));
+}
 
+async function getHistoriaAcademicaSinCache(carrera?: string): Promise<GuaraniFetched<HistoriaAcademicaInfo>> {
   return withGuaraniLock(async () => {
     try {
       const { activa, disponibles } = await ensureCarreraActiva(carrera);
@@ -1048,11 +1263,13 @@ export async function getHistoriaAcademica(carrera?: string, forzarRefresco = fa
           const avanceRaw = await readGuaraniText(avanceResResult.value);
           let avanceHtml = unwrapChulupiHtml(avanceRaw);
 
-          const match = avanceHtml.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/);
-          if (match) {
+          for (const payload of extractOnArrivalPayloads(avanceHtml)) {
             try {
-              const arrival = JSON.parse(match[1]);
-              if (arrival.content) avanceHtml = arrival.content;
+              const arrival = JSON.parse(payload);
+              if (arrival.content) {
+                avanceHtml = arrival.content;
+                break;
+              }
             } catch {}
           }
 
@@ -1079,8 +1296,9 @@ export async function getHistoriaAcademica(carrera?: string, forzarRefresco = fa
         }
       }
 
-      historiaCache.set(cacheKey, { data: parsed, expires: Date.now() + GUARANI_CACHE_TTL_MS });
-      return parsed;
+      // Una historia totalmente vacía puede ser HTML inesperado: no se cachea
+      const cacheable = parsed.totalAprobadas > 0 || parsed.materiasRegulares.length > 0;
+      return { data: parsed, cacheable, carreraKey: activa ? normalizeCareer(activa) : undefined };
     } catch (err) {
       logger.error("Error al obtener historia académica en Guaraní", err);
       throw err;
@@ -1090,7 +1308,8 @@ export async function getHistoriaAcademica(carrera?: string, forzarRefresco = fa
 
 // 3. Obtener mesas de examen final disponibles para una materia
 export async function getMesasDisponibles(carrera: string, materia: string, forzarRefresco = false): Promise<MesaExamenInfo[]> {
-  return ttlCached(`mesas:${carrera}:${materia}`, 45_000, forzarRefresco, () => getMesasSinCache(carrera, materia));
+  const k = ttlCarreraKey(carrera);
+  return ttlCached(`mesas:${k.key}:${normalizeMateria(materia)}`, 45_000, forzarRefresco || k.force, () => getMesasSinCache(carrera, materia));
 }
 
 async function getMesasSinCache(carrera: string, materia: string): Promise<MesaExamenInfo[]> {
@@ -1120,7 +1339,7 @@ export function parsePlanEstudio(html: string): PlanEstudiosInfo {
   const accGroups = $(".accordion-group").length > 0 ? $(".accordion-group") : $(".modulos.accordion, .accordion");
   accGroups.each((_, acc) => {
     const toggleText = $(acc).find(".accordion-toggle").first().text().replace(/\s+/g, " ").trim();
-    const anioMatch = /(\d+)°\s*A[nñ]o/i.exec(toggleText);
+    const anioMatch = /(\d+)\s*(?:[°ºª]|er|ro|do|to|mo|vo|no)?\s*A[nñ]o/i.exec(toggleText);
     const defaultAnio = anioMatch ? parseInt(anioMatch[1], 10) : 1;
 
     $(acc).find("tr.materia").each((__, tr) => {
@@ -1258,9 +1477,25 @@ export function isPotentialDependent(cand: MateriaPlan, target: MateriaPlan): bo
   return false;
 }
 
-function getPlanCachePath(propuesta?: string, plan?: string, version?: string): string {
-  const rawKey = `${propuesta || "prop"}_${plan || "plan"}_${version || "v1"}`.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return path.join(CONFIG.CACHE_DIR, `correlativas_${rawKey}.json`);
+// La carrera activa con la que se leyó cada plan (evita que planes sin encabezado compartan un mismo archivo)
+const planCarreraKey = new WeakMap<PlanEstudiosInfo, string>();
+
+function getPlanCachePath(propuesta?: string, plan?: string, version?: string, carreraKey?: string): string {
+  const base = propuesta || (carreraKey ? `carrera_${carreraKey}` : "prop");
+  const rawKey = `${base}_${plan || "plan"}_${version || "v1"}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 150);
+  // "correlativas2_": versión nueva del formato (descarta entradas vacías guardadas por error en versiones previas)
+  return path.join(CONFIG.CACHE_DIR, `correlativas2_${rawKey}.json`);
+}
+
+function planCachePathFor(p: PlanEstudiosInfo): string {
+  return getPlanCachePath(p.propuesta, p.plan, p.version, planCarreraKey.get(p));
+}
+
+// Respuesta de correlativas con estructura reconocible (tablas de cursar/aprobar o encabezado de correlatividades)
+function correlativasEstructuraValida(html: string): boolean {
+  const $ = cheerio.load(html);
+  const hayTabla = $("table").filter((_, t) => /cursar|aprobar/i.test($(t).attr("summary") || "")).length > 0;
+  return hayTabla || /correlativ/i.test($.text());
 }
 
 function loadPlanCorrelativasCache(
@@ -1279,7 +1514,9 @@ function savePlanCorrelativasCache(cachePath: string, cache: Record<string, unkn
     if (!fs.existsSync(CONFIG.CACHE_DIR)) {
       fs.mkdirSync(CONFIG.CACHE_DIR, { recursive: true, mode: 0o700 });
     }
-    fs.writeFileSync(cachePath, JSON.stringify(cache), "utf8");
+    const tmp = `${cachePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(cache), "utf8");
+    fs.renameSync(tmp, cachePath);
   } catch {}
 }
 
@@ -1293,6 +1530,7 @@ export interface GraphJob {
 
 const inMemoryGraphs = new Map<string, Record<string, { paraCursar: CorrelativaRequisito[]; paraAprobar: CorrelativaRequisito[] }>>();
 const inFlightJobs = new Map<string, GraphJob>();
+let graphGeneration = 0;
 
 function getGraph(cachePath: string): Record<string, { paraCursar: CorrelativaRequisito[]; paraAprobar: CorrelativaRequisito[] }> {
   let graph = inMemoryGraphs.get(cachePath);
@@ -1304,6 +1542,7 @@ function getGraph(cachePath: string): Record<string, { paraCursar: CorrelativaRe
 }
 
 export function clearGuaraniGraphCache(): void {
+  graphGeneration++;
   inMemoryGraphs.clear();
   inFlightJobs.clear();
 }
@@ -1359,6 +1598,7 @@ export function startGraphJob(
     failed: []
   };
 
+  const jobGen = graphGeneration;
   job.promise = (async () => {
     let qIdx = 0;
     let dirty = false;
@@ -1378,8 +1618,18 @@ export function startGraphJob(
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             priority: "low"
           });
+          if (!corrRes.ok) throw new Error(`HTTP ${corrRes.status}`);
           const corrHtml = unwrapChulupiHtml(await readGuaraniText(corrRes));
           const parsed = parseCorrelativasHtml(corrHtml);
+          // Resultado vacío + HTML irreconocible = fallo (no "sin correlativas"): no se persiste
+          if (
+            parsed.paraCursar.length === 0 &&
+            parsed.paraAprobar.length === 0 &&
+            !correlativasEstructuraValida(corrHtml)
+          ) {
+            throw new Error("HTML de correlativas inesperado");
+          }
+          if (jobGen !== graphGeneration) return; // sesión purgada durante la descarga
           graph[m.elementoId!] = parsed;
           job.fetched++;
           dirty = true;
@@ -1390,11 +1640,11 @@ export function startGraphJob(
     });
 
     await Promise.all(workers);
-    if (dirty) {
+    if (dirty && jobGen === graphGeneration) {
       savePlanCorrelativasCache(cachePath, graph);
     }
     job.done = true;
-    inFlightJobs.delete(cachePath);
+    if (inFlightJobs.get(cachePath) === job) inFlightJobs.delete(cachePath);
   })();
 
   inFlightJobs.set(cachePath, job);
@@ -1408,13 +1658,15 @@ export async function prefetchPlanGraph(carrera?: string): Promise<void> {
 
   try {
     const planInfo = await withGuaraniLock(async () => {
-      await ensureCarreraActiva(carrera);
+      const { activa } = await ensureCarreraActiva(carrera);
       const res = await guaraniFetch("/plan_estudio");
       const rawText = await readGuaraniText(res);
-      return parsePlanEstudio(unwrapChulupiHtml(rawText));
+      const plan = parsePlanEstudio(unwrapChulupiHtml(rawText));
+      if (activa) planCarreraKey.set(plan, normalizeCareer(activa));
+      return plan;
     });
 
-    const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
+    const cachePath = planCachePathFor(planInfo);
     const job = startGraphJob(planInfo, cachePath);
     await job.promise;
     logger.info(`Grafo de correlatividades pre-calentado con éxito para ${planInfo.propuesta || "carrera activa"}.`);
@@ -1452,7 +1704,7 @@ export async function getPlanEstudio(
 ): Promise<PlanEstudiosInfo> {
   const planInfo = await withGuaraniLock(async () => {
     try {
-      await ensureCarreraActiva(carrera);
+      const { activa: carreraPlan } = await ensureCarreraActiva(carrera);
 
       // Lanzar plan de estudio y calendario en paralelo
       const [planResResult, calResResult] = await Promise.allSettled([
@@ -1491,6 +1743,7 @@ export async function getPlanEstudio(
         }
       } catch {}
 
+      if (carreraPlan) planCarreraKey.set(parsed, normalizeCareer(carreraPlan));
       return parsed;
     } catch (err) {
       logger.error("Error al obtener plan de estudio en Guaraní", err);
@@ -1502,7 +1755,7 @@ export async function getPlanEstudio(
     return planInfo;
   }
 
-  const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
+  const cachePath = planCachePathFor(planInfo);
 
   let mat: MateriaPlan | undefined;
   let priorityIds: string[] = [];
@@ -1510,11 +1763,10 @@ export async function getPlanEstudio(
 
   if (targetMateria) {
     const normTarget = normalizeMateria(targetMateria);
+    // Código exacto, luego nombre exacto normalizado, luego subconjunto solo si es único ("Derecho Civil" != "Derecho Civil II")
     mat =
-      planInfo.materias.find(
-        (m) => normalizeMateria(m.nombre) === normTarget || m.codigo.toLowerCase() === normTarget.toLowerCase()
-      ) ||
-      planInfo.materias.find((m) => matchMateriaFilter(m.nombre, targetMateria));
+      planInfo.materias.find((m) => m.codigo && m.codigo.toLowerCase() === normTarget.toLowerCase()) ||
+      findMateriaUnica(planInfo.materias, (m) => m.nombre, targetMateria);
     if (mat) {
       priorityIds = [mat.elementoId].filter(Boolean) as string[];
       targetAnio = mat.anio;
@@ -1573,7 +1825,7 @@ export async function getPlanEstudio(
 
     mat.correlativasParaAprobar = paraAprobar.map((req) => ({
       ...req,
-      ...evaluarRequisito({ ...req, condicionRequerida: "Aprobada" }, planInfo.materias)
+      ...evaluarRequisito(req, planInfo.materias)
     }));
   } else {
     mat.correlativasParaCursar = [];
@@ -1688,11 +1940,14 @@ export async function getPlanEstudio(
 export interface MisInscripcionesResult {
   inscripciones: MesaExamenInfo[];
   mensaje: string;
+  // true si alguna de las páginas de Guaraní no se pudo leer (resultado incompleto; no se cachea)
+  parcial?: boolean;
 }
 
 // 5. Consultar inscripciones activas a mesas de examen final (en /actuacion_provisoria o /inscripcion_examen)
 export async function getMisInscripcionesExamen(carrera?: string, forzarRefresco = false): Promise<MisInscripcionesResult> {
-  return ttlCached(`inscr:${carrera ?? ""}`, 45_000, forzarRefresco, () => getMisInscripcionesSinCache(carrera));
+  const k = ttlCarreraKey(carrera);
+  return ttlCached(`inscr:${k.key}`, 45_000, forzarRefresco || k.force, () => getMisInscripcionesSinCache(carrera), (r) => !r.parcial);
 }
 
 async function getMisInscripcionesSinCache(carrera?: string): Promise<MisInscripcionesResult> {
@@ -1701,51 +1956,80 @@ async function getMisInscripcionesSinCache(carrera?: string): Promise<MisInscrip
 
     const inscripciones: MesaExamenInfo[] = [];
 
-    // 1. Consultar /actuacion_provisoria (página oficial de exámenes y promociones en curso)
-    try {
-      const provRes = await guaraniFetch("/actuacion_provisoria");
-      const provRaw = await readGuaraniText(provRes);
-      const provHtml = unwrapChulupiHtml(provRaw);
+    // Ambas páginas son de solo lectura e independientes: se consultan en paralelo dentro del lock
+    const leer = async (ruta: string): Promise<string> => {
+      const res = await guaraniFetch(ruta);
+      if (!res.ok) throw new Error(`HTTP ${res.status} en ${ruta}`);
+      return readGuaraniText(res);
+    };
+    const [provRes, insRes] = await Promise.allSettled([leer("/actuacion_provisoria"), leer("/inscripcion_examen")]);
 
-      if (!provHtml.includes("No hay información sobre actuaciones provisorias en exámenes") && !provHtml.includes("No hay informaci\\u00f3n")) {
-        const parsed = parseMesasExamen(provHtml);
-        inscripciones.push(...parsed);
+    // Una sesión vencida nunca se traga en silencio
+    for (const r of [provRes, insRes]) {
+      if (r.status === "rejected" && (r.reason instanceof GuaraniSessionExpiredError || r.reason instanceof SessionExpiredError)) {
+        throw r.reason;
       }
-    } catch {}
+    }
+    if (provRes.status === "rejected" && insRes.status === "rejected") {
+      throw provRes.reason;
+    }
+    let parcial = false;
 
-    // 2. Si la inscripción a examen está abierta, consultar también /inscripcion_examen
-    try {
-      const insRes = await guaraniFetch("/inscripcion_examen");
-      const insRaw = await readGuaraniText(insRes);
-      const insHtml = unwrapChulupiHtml(insRaw);
-      if (!insRaw.includes('"cod":"-2"') && !insHtml.includes("No hay llamados")) {
-        const $ = cheerio.load(insHtml);
-        $(".mesa-inscripta, tr.inscripto, .item-inscripto").each((_, el) => {
-          const matNombre = $(el).find(".materia, td.materia, h4").first().text().trim();
-          const rawFecha = $(el).find(".fecha, td.fecha").first().text().trim() || undefined;
-          const rawHora = $(el).find(".hora, td.hora").first().text().trim() || undefined;
-          const tribunal = $(el).find(".tribunal, td.tribunal").first().text().trim() || undefined;
-          if (matNombre && !inscripciones.some((i) => i.materia === matNombre)) {
-            inscripciones.push({
-              materia: matNombre,
-              llamadoId: $(el).attr("data-llamado") || `inscripta_${matNombre}`,
-              fecha: rawFecha,
-              hora: rawHora,
-              tribunal,
-              inscripcionAbierta: true,
-              condicionPermitida: "Regular"
-            });
-          }
-        });
+    // 1. /actuacion_provisoria (página oficial de exámenes y promociones en curso)
+    if (provRes.status === "fulfilled") {
+      try {
+        const provHtml = unwrapChulupiHtml(provRes.value);
+        if (!provHtml.includes("No hay información sobre actuaciones provisorias en exámenes") && !provHtml.includes("No hay informaci\\u00f3n")) {
+          inscripciones.push(...parseMesasExamen(provHtml));
+        }
+      } catch {
+        parcial = true;
       }
-    } catch {}
+    } else {
+      parcial = true;
+    }
 
+    // 2. /inscripcion_examen
+    if (insRes.status === "fulfilled") {
+      try {
+        const insRaw = insRes.value;
+        const insHtml = unwrapChulupiHtml(insRaw);
+        if (!insRaw.includes('"cod":"-2"') && !insHtml.includes("No hay llamados")) {
+          const $ = cheerio.load(insHtml);
+          $(".mesa-inscripta, tr.inscripto, .item-inscripto").each((_, el) => {
+            const matNombre = $(el).find(".materia, td.materia, h4").first().text().trim();
+            const rawFecha = $(el).find(".fecha, td.fecha").first().text().trim() || undefined;
+            const rawHora = $(el).find(".hora, td.hora").first().text().trim() || undefined;
+            const tribunal = $(el).find(".tribunal, td.tribunal").first().text().trim() || undefined;
+            if (matNombre && !inscripciones.some((i) => i.materia === matNombre)) {
+              inscripciones.push({
+                materia: matNombre,
+                llamadoId: $(el).attr("data-llamado") || `inscripta_${matNombre}`,
+                fecha: rawFecha,
+                hora: rawHora,
+                tribunal,
+                inscripcionAbierta: true,
+                condicionPermitida: "Regular"
+              });
+            }
+          });
+        }
+      } catch {
+        parcial = true;
+      }
+    } else {
+      parcial = true;
+    }
+
+    const aviso = parcial ? " (No se pudo consultar una de las secciones de Guaraní: el resultado puede estar incompleto.)" : "";
     const mensaje =
       inscripciones.length > 0
-        ? `Se encontraron ${inscripciones.length} inscripción(es) a examen final en SIU Guaraní.`
-        : "No registrás inscripciones activas a mesas de examen final en SIU Guaraní.";
+        ? `Se encontraron ${inscripciones.length} inscripción(es) a examen final en SIU Guaraní.${aviso}`
+        : parcial
+          ? `No se pudieron confirmar tus inscripciones a examen: falló la consulta a SIU Guaraní. Reintentá en unos segundos.`
+          : "No registrás inscripciones activas a mesas de examen final en SIU Guaraní.";
 
-    return { inscripciones, mensaje };
+    return { inscripciones, mensaje, parcial: parcial || undefined };
   });
 }
 
@@ -1770,17 +2054,12 @@ export async function getEncuestasPendientes(carrera?: string): Promise<Encuesta
     const raw = await readGuaraniText(res);
 
     let encuestasContent = "";
-    const match = raw.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/g);
-    if (match) {
-      for (const m of match) {
-        if (m.includes("lista_encuestas_pendientes")) {
-          try {
-            const jsonStr = m.replace(/^kernel\.renderer\.on_arrival\(/, "").replace(/\);$/, "");
-            const parsed = JSON.parse(jsonStr);
-            if (parsed.content) encuestasContent = parsed.content;
-          } catch {}
-        }
-      }
+    for (const payload of extractOnArrivalPayloads(raw)) {
+      if (!payload.includes("lista_encuestas_pendientes")) continue;
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.content) encuestasContent = parsed.content;
+      } catch {}
     }
 
     if (!encuestasContent) {
@@ -1907,13 +2186,14 @@ export function parseHorarioSemanal(rawText: string): ClaseHorario[] {
       const j = JSON.parse(rawText);
       if (typeof j?.cont === "string") cont = j.cont;
     } catch {}
-    const match = cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);\s*<\/script>/) ||
-      cont.match(/kernel\.renderer\.on_arrival\(([\s\S]*?)\);/);
-    if (match) {
-      const data = JSON.parse(match[1]);
-      if (Array.isArray(data?.info?.asignaciones)) {
-        asignaciones = data.info.asignaciones;
-      }
+    for (const payload of extractOnArrivalPayloads(cont)) {
+      try {
+        const data = JSON.parse(payload);
+        if (Array.isArray(data?.info?.asignaciones)) {
+          asignaciones = data.info.asignaciones;
+          break;
+        }
+      } catch {}
     }
   } catch {}
 
@@ -1953,7 +2233,8 @@ export function parseHorarioSemanal(rawText: string): ClaseHorario[] {
 
 // 8. Consultar horario semanal estructurado y clases del día ("¿Qué tengo hoy?")
 export async function getHorarioSemanal(carrera?: string, diaFiltro?: string, forzarRefresco = false): Promise<HorarioSemanalInfo> {
-  return ttlCached(`horario:${carrera ?? ""}:${diaFiltro ?? ""}:${new Date().toDateString()}`, 45_000, forzarRefresco, () => getHorarioSemanalSinCache(carrera, diaFiltro));
+  const k = ttlCarreraKey(carrera);
+  return ttlCached(`horario:${k.key}:${(diaFiltro ?? "").trim().toLowerCase()}:${new Date().toDateString()}`, 45_000, forzarRefresco || k.force, () => getHorarioSemanalSinCache(carrera, diaFiltro));
 }
 
 async function getHorarioSemanalSinCache(carrera?: string, diaFiltro?: string): Promise<HorarioSemanalInfo> {
@@ -1965,20 +2246,26 @@ async function getHorarioSemanalSinCache(carrera?: string, diaFiltro?: string): 
 
   const normDia = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 
+  const nombreDiaDe = (d: Date): string | undefined => {
+    const w = normDia(d.toLocaleDateString("es-AR", { weekday: "long", timeZone: "America/Argentina/Buenos_Aires" }));
+    return Object.values(DIAS_NOMBRE_MAP).find((x) => normDia(x) === w);
+  };
+
   let diaTarget: string | undefined;
   if (diaFiltro) {
     const dfNorm = normDia(diaFiltro);
     if (dfNorm === "hoy" || dfNorm === "today") {
-      const hoyStr = new Date().toLocaleDateString("es-AR", {
-        weekday: "long",
-        timeZone: "America/Argentina/Buenos_Aires"
-      });
-      diaTarget = hoyStr.charAt(0).toUpperCase() + hoyStr.slice(1).toLowerCase();
-      if (normDia(diaTarget).startsWith("miercol")) diaTarget = "Miércoles";
-      if (normDia(diaTarget).startsWith("sabad")) diaTarget = "Sábado";
+      diaTarget = nombreDiaDe(new Date());
+    } else if (dfNorm === "manana" || dfNorm === "tomorrow") {
+      diaTarget = nombreDiaDe(new Date(Date.now() + 24 * 60 * 60 * 1000));
     } else {
-      const match = Object.values(DIAS_NOMBRE_MAP).find((d) => normDia(d).startsWith(dfNorm.slice(0, 3)));
-      diaTarget = match || diaFiltro;
+      diaTarget =
+        dfNorm.length >= 3
+          ? Object.values(DIAS_NOMBRE_MAP).find((d) => normDia(d).startsWith(dfNorm.slice(0, 3)))
+          : undefined;
+    }
+    if (!diaTarget) {
+      throw new Error(`Día no reconocido: '${diaFiltro}'. Usá "hoy", "mañana" o un día de la semana (lunes a domingo).`);
     }
   }
 
@@ -2041,7 +2328,7 @@ export interface PlanOptimoInfo {
 // 9. Plan óptimo de cursada: ranking por cierre transitivo de correlatividades y camino crítico
 export async function getPlanOptimo(carrera?: string, maxMateriasSugeridas = 5): Promise<PlanOptimoInfo> {
   const planInfo = await getPlanEstudio(carrera);
-  const cachePath = getPlanCachePath(planInfo.propuesta, planInfo.plan, planInfo.version);
+  const cachePath = planCachePathFor(planInfo);
   const graph = getGraph(cachePath);
 
   const pendientes = new Map<string, MateriaPlan>();
@@ -2190,6 +2477,12 @@ export interface EvaluacionCronograma {
   observaciones?: string;
 }
 
+function fechaCronogramaTs(f: string): number {
+  const m = /(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(f);
+  if (!m) return NaN;
+  return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1])).getTime();
+}
+
 // Parser puro de la operación "Cronograma de evaluaciones" (/cronograma_evaluaciones)
 export function parseCronogramaEvaluaciones(html: string): { carrera?: string; evaluaciones: EvaluacionCronograma[] } {
   const $ = cheerio.load(html);
@@ -2202,12 +2495,15 @@ export function parseCronogramaEvaluaciones(html: string): { carrera?: string; e
     if (!m || table.length === 0) return;
     table.find("tbody tr").each((__, tr) => {
       const c = $(tr).find("td").map((___, td) => $(td).text().replace(/\s+/g, " ").trim()).get();
-      if (c.length < 3 || !/\d{1,2}\/\d{1,2}\/\d{4}/.test(c[0])) return;
+      const fechaMatch = /(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(c[0] || "");
+      if (c.length < 3 || !fechaMatch) return;
+      const fechaTs = new Date(Number(fechaMatch[3]), Number(fechaMatch[2]) - 1, Number(fechaMatch[1])).getTime();
+      if (Number.isNaN(fechaTs)) return;
       evaluaciones.push({
         materia: m[1].trim(),
         codigo: m[2],
         comision: m[3].trim(),
-        fecha: c[0],
+        fecha: fechaMatch[0],
         evaluacion: c[1],
         tipo: c[2],
         horaInicio: c[3] || undefined,
@@ -2216,11 +2512,7 @@ export function parseCronogramaEvaluaciones(html: string): { carrera?: string; e
       });
     });
   });
-  const ts = (f: string) => {
-    const [d, mo, y] = f.split("/").map(Number);
-    return new Date(y, mo - 1, d).getTime();
-  };
-  evaluaciones.sort((a, b) => ts(a.fecha) - ts(b.fecha));
+  evaluaciones.sort((a, b) => fechaCronogramaTs(a.fecha) - fechaCronogramaTs(b.fecha));
   return { carrera, evaluaciones };
 }
 
@@ -2228,6 +2520,7 @@ export interface CronogramaEvaluacionesResult {
   carrera?: string;
   total: number;
   evaluaciones: EvaluacionCronograma[];
+  materiasSinFechasCargadas?: string[];
   mensaje: string;
 }
 
@@ -2237,32 +2530,47 @@ export async function getCronogramaEvaluaciones(
   soloProximas = true,
   forzarRefresco = false
 ): Promise<CronogramaEvaluacionesResult> {
-  return ttlCached(`cronograma:${carrera ?? ""}`, 60_000, forzarRefresco, () =>
+  const kc = ttlCarreraKey(carrera);
+  return ttlCached(`cronograma:${kc.key}`, 60_000, forzarRefresco || kc.force, () =>
     withGuaraniLock(async () => {
       await ensureCarreraActiva(carrera);
       const res = await guaraniFetch("/cronograma_evaluaciones");
       const parsed = parseCronogramaEvaluaciones(unwrapChulupiHtml(await readGuaraniText(res)));
       return parsed;
     })
-  ).then((parsed) => {
+  ).then(async (parsed) => {
+    // Materias en curso sin ninguna evaluación en el cronograma de Guaraní (para no dar a entender que el listado es completo)
+    let materiasSinFechasCargadas: string[] = [];
+    try {
+      const norm = (t: string) => t.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/\s+/g, " ").trim();
+      const conFechas = parsed.evaluaciones;
+      const enCurso = await getMateriasEnCurso();
+      materiasSinFechasCargadas = enCurso
+        .filter((m) => !conFechas.some((e) => (m.codigo && e.codigo === m.codigo) || norm(e.materia) === norm(m.nombre)))
+        .map((m) => m.nombre);
+    } catch {}
     const hoy = new Date();
     hoy.setHours(0, 0, 0, 0);
     const lista = soloProximas
       ? parsed.evaluaciones.filter((e) => {
-          const [d, mo, y] = e.fecha.split("/").map(Number);
-          return new Date(y, mo - 1, d).getTime() >= hoy.getTime();
+          const t = fechaCronogramaTs(e.fecha);
+          return Number.isNaN(t) || t >= hoy.getTime(); // fecha ilegible: se muestra igual
         })
       : parsed.evaluaciones;
     return {
       carrera: parsed.carrera,
       total: lista.length,
       evaluaciones: lista,
+      materiasSinFechasCargadas,
       mensaje:
-        lista.length > 0
+        (lista.length > 0
           ? `Tenés ${lista.length} evaluación(es) ${soloProximas ? "próxima(s)" : "cargada(s)"} en el cronograma oficial de SIU Guaraní.`
           : soloProximas
             ? "No hay evaluaciones próximas cargadas en el cronograma de SIU Guaraní (puede que las cátedras aún no las hayan publicado; probá eva_cronograma)."
-            : "No hay evaluaciones cargadas en el cronograma de SIU Guaraní."
+            : "No hay evaluaciones cargadas en el cronograma de SIU Guaraní.") +
+        (materiasSinFechasCargadas.length > 0
+          ? ` OJO: este listado NO es completo. Estas materias en curso no tienen fechas cargadas en Guaraní: ${materiasSinFechasCargadas.join(", ")}. Para ellas usá eva_cronograma, eva_entregas_proximas y eva_cuestionarios, o consultá al docente.`
+          : "")
     };
   });
 }

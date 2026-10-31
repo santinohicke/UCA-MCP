@@ -1,6 +1,6 @@
 {
   "name": "uca-mcp",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Model Context Protocol (MCP) server para la Universidad Católica Argentina (UCA) - Proyecto No Oficial",
   "type": "module",
   "bin": {
@@ -19,7 +19,7 @@
     "tsconfig.json"
   ],
   "license": "MIT",
-  "author": "Comunidad Estudiantil UCA",
+  "author": "Santino Hickethier",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/santinohicke/UCA-MCP.git"

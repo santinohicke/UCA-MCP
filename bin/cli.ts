@@ -19,9 +19,10 @@ const { values, positionals } = parseArgs({
 });
 
 const command = positionals[0];
+const isServeMode = !command || command === "serve";
 
 async function main() {
-  if (values.version || command === "version" || command === "-v" || command === "--version") {
+  if (values.version || command === "version") {
     const { CONFIG } = await import("../src/config.js");
     console.log(`v${CONFIG.VERSION}`);
     process.exit(0);
@@ -30,12 +31,13 @@ async function main() {
   const unknownFlags = Object.keys(values).filter(
     (k) => k !== "help" && k !== "version" && k !== "keep-browser" && k !== "json"
   );
-  if (unknownFlags.length > 0) {
+  // En modo servidor se ignoran flags desconocidos (ej. --stdio) para no romper clientes MCP
+  if (unknownFlags.length > 0 && !isServeMode) {
     console.error(`Opción desconocida: --${unknownFlags[0]}. Ejecutá 'uca-mcp --help' para ver opciones.`);
     process.exit(1);
   }
 
-  if (values.help || command === "help" || command === "-h" || command === "--help") {
+  if (values.help || command === "help") {
     const { CONFIG } = await import("../src/config.js");
     console.log(`
 UCA MCP - Servidor y Utilidades CLI (v${CONFIG.VERSION})
@@ -185,6 +187,19 @@ Comandos:
     const { CONFIG } = await import("../src/config.js");
 
     const targetClient = (positionals[1] || "all").toLowerCase();
+    const validClients = ["claude", "cursor", "vscode", "all"];
+    if (!validClients.includes(targetClient)) {
+      console.error(`Cliente desconocido: '${targetClient}'. Clientes válidos: ${validClients.join(", ")}.`);
+      process.exit(1);
+    }
+    const writeJsonAtomic = (file: string, data: unknown, backup = false) => {
+      if (backup && fs.existsSync(file)) {
+        try { fs.copyFileSync(file, file + ".bak"); } catch {}
+      }
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+      fs.renameSync(tmp, file);
+    };
     console.log(`Configurando UCA MCP para: ${targetClient}...`);
 
     let mcpEntry: { command: string; args: string[] };
@@ -226,7 +241,7 @@ Comandos:
           if (!config.mcpServers) config.mcpServers = {};
         }
         config.mcpServers["uca"] = mcpEntry;
-        fs.writeFileSync(claudeConfigFile, JSON.stringify(config, null, 2), "utf8");
+        writeJsonAtomic(claudeConfigFile, config, true);
         console.log(`[OK] Claude Desktop configurado en: ${claudeConfigFile}`);
       } catch (err) {
         console.warn(`[AVISO] No se pudo escribir configuración de Claude Desktop: ${err}`);
@@ -247,7 +262,7 @@ Comandos:
           if (!config.mcpServers) config.mcpServers = {};
         }
         config.mcpServers["uca"] = mcpEntry;
-        fs.writeFileSync(cursorConfigFile, JSON.stringify(config, null, 2), "utf8");
+        writeJsonAtomic(cursorConfigFile, config, true);
         console.log(`[OK] Cursor configurado en: ${cursorConfigFile}`);
       } catch (err) {
         console.warn(`[AVISO] No se pudo escribir configuración de Cursor: ${err}`);
@@ -271,7 +286,7 @@ Comandos:
           type: "stdio",
           ...mcpEntry
         };
-        fs.writeFileSync(vscodeConfigFile, JSON.stringify(config, null, 2), "utf8");
+        writeJsonAtomic(vscodeConfigFile, config, true);
         console.log(`[OK] VS Code configurado en: ${vscodeConfigFile}`);
       } catch (err) {
         console.warn(`[AVISO] No se pudo escribir configuración de VS Code: ${err}`);

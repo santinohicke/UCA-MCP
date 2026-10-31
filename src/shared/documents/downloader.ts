@@ -23,7 +23,7 @@ export interface DownloadResult {
 }
 
 // Descarga un archivo de EVA con validación estricta de HTTPS, host, redirecciones seguras y caché persistente
-export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefresco = false): Promise<DownloadResult> {
+export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefresco = false, ttlMs?: number): Promise<DownloadResult> {
   if (!forzarRefresco) {
     const cached = fileCache.get(fileUrl);
     if (cached && Date.now() < cached.expires) {
@@ -31,11 +31,11 @@ export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefre
     }
   }
 
-  // Comprobar caché persistente cifrada en disco (TTL 24 horas, AES-256-GCM)
+  // Comprobar caché persistente cifrada en disco (TTL 7 días por defecto, AES-256-GCM)
   const cacheKey = crypto.createHash("sha256").update(fileUrl).digest("hex");
   const cacheMetaPath = path.join(CONFIG.CACHE_DIR, `${cacheKey}.json`);
   const cacheDataPath = path.join(CONFIG.CACHE_DIR, `${cacheKey}.bin`);
-  const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  const CACHE_TTL_MS = ttlMs ?? 7 * 24 * 60 * 60 * 1000;
 
   if (!forzarRefresco && fs.existsSync(cacheMetaPath) && fs.existsSync(cacheDataPath)) {
     try {
@@ -100,9 +100,14 @@ export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefre
   }
 
   // Timeout extendido de 120s para la conexión y streaming del cuerpo completo
-  const response = await evaFetch(parsed.href, {
-    signal: AbortSignal.timeout(120000)
-  });
+  let response: Response;
+  try {
+    response = await evaFetch(parsed.href, { signal: AbortSignal.timeout(120000) });
+  } catch (err: any) {
+    if (err?.name !== "TimeoutError" && err?.name !== "AbortError") throw err;
+    // Un reintento con señal nueva ante timeout transitorio
+    response = await evaFetch(parsed.href, { signal: AbortSignal.timeout(120000) });
+  }
 
   const finalUrl = response.url || parsed.href;
   const finalParsed = new URL(finalUrl, CONFIG.EVA_BASE_URL);
@@ -198,26 +203,12 @@ export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefre
     const subUrl = embeddedLink.attr("src") || embeddedLink.attr("data") || embeddedLink.attr("href");
     if (subUrl) {
       if (depth >= 2) throw new Error("Límite de recursión alcanzado al resolver recurso embebido.");
-      return downloadSecureFile(subUrl, depth + 1, forzarRefresco);
+      return downloadSecureFile(subUrl, depth + 1, forzarRefresco, ttlMs);
     }
   }
 
-  const disposition = response.headers.get("content-disposition") || "";
-  const filenameMatch = /filename\*?=['"]?(?:UTF-\d['"]*)?([^;\r\n"']*)['"]?/i.exec(disposition);
-
-  let filename = "archivo";
-  if (filenameMatch) {
-    try {
-      filename = decodeURIComponent(filenameMatch[1]);
-    } catch {
-      filename = filenameMatch[1];
-    }
-  } else {
-    filename = new URL(currentUrl).pathname.split("/").pop() || "archivo";
-    try {
-      filename = decodeURIComponent(filename);
-    } catch {}
-  }
+  const filename = parseContentDispositionFilename(response.headers.get("content-disposition") || "") ||
+    safeDecode(new URL(currentUrl).pathname.split("/").pop() || "") || "archivo";
 
   const result: DownloadResult = {
     buffer,
@@ -251,4 +242,39 @@ export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefre
   }
 
   return result;
+}
+
+function safeDecode(s: string): string {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
+// Si el texto parece UTF-8 leído como latin1 (mojibake), lo redecodifica
+function fixMojibake(s: string): string {
+  if (!/[\u00c2-\u00c3][\u0080-\u00bf]/.test(s)) return s;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(s, "latin1"));
+  } catch {
+    return s;
+  }
+}
+
+// Extrae el nombre de archivo de Content-Disposition (filename* RFC 5987 o filename=)
+export function parseContentDispositionFilename(disposition: string): string {
+  const star = /filename\*\s*=\s*([^']*)'[^']*'([^;\r\n]*)/i.exec(disposition);
+  if (star) {
+    const charset = (star[1] || "utf-8").toLowerCase();
+    const raw = star[2].trim().replace(/^"|"$/g, "");
+    try {
+      if (charset.includes("8859") || charset === "latin1") return unescape(raw);
+      return decodeURIComponent(raw);
+    } catch {
+      return fixMojibake(raw);
+    }
+  }
+  const plain = /filename\s*=\s*(?:"([^"]*)"|([^;\r\n]*))/i.exec(disposition);
+  if (plain) {
+    const raw = (plain[1] ?? plain[2] ?? "").trim();
+    return fixMojibake(safeDecode(raw));
+  }
+  return "";
 }

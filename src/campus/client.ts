@@ -79,12 +79,26 @@ function formatMonto(saldo: string): string {
   return `$ ${n.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+// Acepta true/false, 1/0 y "true"/"false"/"1"/"0"; cualquier otro valor se considera desconocido
+function parseBooleano(v: unknown): boolean | undefined {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v === 1 ? true : v === 0 ? false : undefined;
+  if (typeof v === "string") {
+    const t = v.trim().toLowerCase();
+    if (t === "true" || t === "1") return true;
+    if (t === "false" || t === "0") return false;
+  }
+  return undefined;
+}
+
 // Aranceles: el portal es una SPA que consume /api/aranceles (saldo + habilitaciones para cursar/rendir)
 export function parseAranceles(raw: unknown): Pick<CampusInfo, "aranceles" | "estadoAranceles" | "saldo" | "puedeCursar" | "puedeRendir"> {
   const obj = (raw ?? {}) as Record<string, any>;
   const data = obj.data && typeof obj.data === "object" ? obj.data : obj;
   const saldoRaw = data.debt ?? data.saldo;
-  if (saldoRaw === undefined || saldoRaw === null || Number.isNaN(Number(saldoRaw))) {
+  // Number("") y Number(" ") valen 0: un saldo vacío no debe leerse como "Al día"
+  const saldoVacio = typeof saldoRaw === "string" && saldoRaw.trim() === "";
+  if (saldoRaw === undefined || saldoRaw === null || saldoVacio || typeof saldoRaw === "boolean" || Number.isNaN(Number(saldoRaw))) {
     throw new Error("Campus Autogestión no devolvió un saldo reconocible. Consultá directamente en https://autogestion.uca.edu.ar.");
   }
   const saldoNum = Number(saldoRaw);
@@ -102,13 +116,14 @@ export function parseAranceles(raw: unknown): Pick<CampusInfo, "aranceles" | "es
     ],
     estadoAranceles: conDeuda ? "Con deuda pendiente" : "Al día",
     saldo: String(saldoRaw),
-    puedeCursar: typeof puedeCursar === "boolean" ? puedeCursar : undefined,
-    puedeRendir: typeof puedeRendir === "boolean" ? puedeRendir : undefined
+    puedeCursar: parseBooleano(puedeCursar),
+    puedeRendir: parseBooleano(puedeRendir)
   };
 }
 
 // Trámites: /api/tramites devuelve un array (vacío si no hay trámites)
-export function parseTramites(raw: unknown): TramiteInfo[] {
+export function parseTramites(rawInput: unknown): TramiteInfo[] {
+  const raw = Array.isArray((rawInput as any)?.data) ? (rawInput as any).data : rawInput;
   if (!Array.isArray(raw)) {
     throw new Error("Campus Autogestión devolvió un formato de trámites no reconocido. Consultá directamente en https://autogestion.uca.edu.ar.");
   }
@@ -126,34 +141,40 @@ export async function getArancelesYTramites(
   consulta: "todo" | "aranceles" | "tramites" = "todo"
 ): Promise<CampusInfo> {
   const result: CampusInfo = { aranceles: [], tramites: [] };
-  let arancelesError: unknown;
-  let tramitesError: unknown;
+  const quiereAranceles = consulta === "todo" || consulta === "aranceles";
+  const quiereTramites = consulta === "todo" || consulta === "tramites";
 
-  if (consulta === "todo" || consulta === "aranceles") {
-    try {
-      Object.assign(result, parseAranceles(await campusJson("/api/aranceles")));
-    } catch (err) {
-      logger.error(`No se pudieron obtener aranceles en Campus Autogestión: ${err}`);
-      arancelesError = err;
-      if (consulta === "aranceles") throw err;
+  // Ambas consultas en paralelo; si una falla no se pierde la otra
+  const [arancelesRes, tramitesRes] = await Promise.allSettled([
+    quiereAranceles ? campusJson("/api/aranceles").then(parseAranceles) : Promise.resolve(undefined),
+    quiereTramites ? campusJson("/api/tramites").then(parseTramites) : Promise.resolve(undefined)
+  ]);
+
+  const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  if (quiereAranceles) {
+    if (arancelesRes.status === "fulfilled" && arancelesRes.value) {
+      Object.assign(result, arancelesRes.value);
+    } else if (arancelesRes.status === "rejected") {
+      logger.error(`No se pudieron obtener aranceles en Campus Autogestión: ${arancelesRes.reason}`);
+      if (consulta === "aranceles") throw arancelesRes.reason;
       result.estadoAranceles = "Error al consultar aranceles";
-      result.errores = { ...result.errores, aranceles: err instanceof Error ? err.message : String(err) };
+      result.errores = { ...result.errores, aranceles: msg(arancelesRes.reason) };
     }
   }
 
-  if (consulta === "todo" || consulta === "tramites") {
-    try {
-      result.tramites = parseTramites(await campusJson("/api/tramites"));
-    } catch (err) {
-      logger.error(`No se pudieron obtener trámites en Campus Autogestión: ${err}`);
-      tramitesError = err;
-      if (consulta === "tramites") throw err;
-      result.errores = { ...result.errores, tramites: err instanceof Error ? err.message : String(err) };
+  if (quiereTramites) {
+    if (tramitesRes.status === "fulfilled" && tramitesRes.value) {
+      result.tramites = tramitesRes.value as TramiteInfo[];
+    } else if (tramitesRes.status === "rejected") {
+      logger.error(`No se pudieron obtener trámites en Campus Autogestión: ${tramitesRes.reason}`);
+      if (consulta === "tramites") throw tramitesRes.reason;
+      result.errores = { ...result.errores, tramites: msg(tramitesRes.reason) };
     }
   }
 
-  if (consulta === "todo" && arancelesError && tramitesError) {
-    throw arancelesError;
+  if (consulta === "todo" && arancelesRes.status === "rejected" && tramitesRes.status === "rejected") {
+    throw arancelesRes.reason;
   }
 
   return result;

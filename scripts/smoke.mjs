@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 const entry = path.resolve(process.argv[2] || "build/src/index.js");
-const FORBIDDEN_KEYS = new Set(["$schema", "additionalProperties", "$ref", "$defs", "definitions", "exclusiveMinimum", "exclusiveMaximum", "oneOf", "anyOf", "allOf", "not", "const", "patternProperties", "propertyNames"]);
+const FORBIDDEN_KEYS = new Set(["$schema", "additionalProperties", "$ref", "$defs", "definitions", "exclusiveMinimum", "exclusiveMaximum", "oneOf", "anyOf", "allOf", "not", "const", "patternProperties", "propertyNames", "default", "pattern"]);
 const problems = [];
 
 function scan(node, where) {

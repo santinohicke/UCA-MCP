@@ -2,13 +2,17 @@ import { evaAjaxRpc, evaAjaxBatch, evaFetch, SessionExpiredError } from "../shar
 import { ttlCached } from "../shared/ttl-cache.js";
 import * as cheerio from "cheerio";
 import { CONFIG } from "../config.js";
-import { registerSessionPurgeHook, loadEncryptedSession, saveEncryptedSession } from "../auth/session.js";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { registerSessionPurgeHook, loadEncryptedSession, saveEncryptedSession, getSessionUserKey } from "../auth/session.js";
+import { getOrCreateMasterKey } from "../auth/keychain.js";
 import { logger } from "../shared/logger.js";
 import { wrapUntrustedContent } from "../shared/native-confirm.js";
 import { downloadSecureFile } from "../shared/documents/downloader.js";
 import { extractPdfContent } from "../shared/documents/pdf-extractor.js";
 import { extractDocxText, extractPptxText, extractXlsxText, extractOdfText } from "../shared/documents/office-extractor.js";
-import { matchMateriaFilter } from "../guarani/client.js";
+import { matchMateriaFilter, normalizeMateria, getMateriasEnCurso } from "../guarani/client.js";
 
 function capSnippet(text: string, maxLen = 800): string {
   if (text.length <= maxLen) return text;
@@ -81,12 +85,77 @@ const materiasCache = new Map<string, { data: MateriaInfo[]; expires: number }>(
 const contenidoCache = new Map<number, { data: SeccionCurso[]; expires: number }>();
 const tareasCache = new Map<string, { data: TareaInfo[]; expires: number }>();
 
+// Contador de generación: una promesa en vuelo de una sesión anterior (logout) no puede repoblar las cachés
+let evaGeneration = 0;
+const materiasInflight = new Map<string, Promise<MateriaInfo[]>>();
+
 export function clearEvaCache(): void {
+  evaGeneration++;
   materiasCache.clear();
   contenidoCache.clear();
   tareasCache.clear();
+  materiasInflight.clear();
+  contenidoInflight.clear();
+  precargaProgramada = false;
+  precargaCorriendo = false;
+  precargaHecha = false;
+  purgarCronogramasEnDisco();
 }
 registerSessionPurgeHook(clearEvaCache);
+
+// Id numérico determinista (estable entre llamadas, fuera del rango de ids reales de Moodle) para elementos sin id
+function idSintetico(...partes: Array<string | number | undefined>): number {
+  const str = partes.map((p) => normalizeMateria(String(p ?? ""))).join("|");
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return 1_000_000_000 + (h % 1_000_000_000);
+}
+
+// Ejecuta tareas con concurrencia acotada conservando el orden de los resultados
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+// Materias de EVA que el alumno cursa ahora: cruce con Guaraní (código o nombre normalizado).
+// Si Guaraní no devuelve nada o falla, se usan todas las de EVA.
+async function getCursosActivos(): Promise<MateriaInfo[]> {
+  const eva = await getMaterias(false);
+  if (eva.length === 0) return eva;
+  let enCurso: Array<{ codigo?: string; nombre: string }> = [];
+  try {
+    enCurso = await getMateriasEnCurso();
+  } catch (err) {
+    if (err instanceof SessionExpiredError) throw err;
+    logger.warn(`No se pudo cruzar con las materias en curso de Guaraní: ${err}`);
+  }
+  if (enCurso.length === 0) return eva;
+  const normCodigo = (c?: string) => (c ? normalizeMateria(c).replace(/ /g, "") : "");
+  const filtradas = eva.filter((c) =>
+    enCurso.some((g) => {
+      const gc = normCodigo(g.codigo);
+      const ec = normCodigo(c.codigo);
+      if (gc && ec && (gc === ec || ec.includes(gc))) return true;
+      const ne = normalizeMateria(c.nombre);
+      const ng = normalizeMateria(g.nombre);
+      if (!ng) return false;
+      return ne === ng || matchMateriaFilter(c.nombre, g.nombre);
+    })
+  );
+  return filtradas.length > 0 ? filtradas : eva;
+}
 
 // Parser puro para materias matriculadas en el dashboard de EVA
 export function parseMateriasFromHtml(html: string): MateriaInfo[] {
@@ -172,7 +241,7 @@ export function parseForosFromHtml(html: string): ForoItem[] {
     const fecha = $(el).find(".time, .posttime, time, .mb-3, .date").first().text().trim() || "Reciente";
     const rawMensaje = $(el).find(".post-content, .message, .content, .post-content-container, .text_to_html, .post-message").first().text().trim() || "";
     const idAttr = $(el).attr("id") || "";
-    const id = parseInt(idAttr.replace(/\D/g, ""), 10) || 1;
+    const id = parseInt(idAttr.replace(/\D/g, ""), 10) || idSintetico("foro", asunto, fecha, autor);
 
     if (asunto || rawMensaje) {
       items.push({
@@ -196,17 +265,33 @@ export async function getMaterias(incluirArchivadas = false, forzarRefresco = fa
     if (cached && Date.now() < cached.expires) {
       return cached.data;
     }
-    // Stale-while-revalidate con caché persistente en sesión cifrada
+    // Stale-while-revalidate con caché persistente en sesión cifrada (un único refresh en vuelo)
     if (!incluirArchivadas) {
       const sess = loadEncryptedSession();
       if (sess?.evaMaterias && sess.evaMaterias.length > 0) {
         materiasCache.set(cacheKey, { data: sess.evaMaterias, expires: Date.now() + CACHE_TTL_MS });
-        getMaterias(false, true).catch(() => {});
+        cargarMaterias(cacheKey, false).catch(() => {});
         return sess.evaMaterias;
       }
     }
   }
+  return cargarMaterias(cacheKey, incluirArchivadas);
+}
 
+// Deduplica llamadas simultáneas a la carga de materias
+function cargarMaterias(cacheKey: string, incluirArchivadas: boolean): Promise<MateriaInfo[]> {
+  const pending = materiasInflight.get(cacheKey);
+  if (pending) return pending;
+  const gen = evaGeneration;
+  const p = cargarMateriasSinCache(incluirArchivadas, gen).finally(() => {
+    if (materiasInflight.get(cacheKey) === p) materiasInflight.delete(cacheKey);
+  });
+  materiasInflight.set(cacheKey, p);
+  return p;
+}
+
+async function cargarMateriasSinCache(incluirArchivadas: boolean, gen: number): Promise<MateriaInfo[]> {
+  const cacheKey = String(incluirArchivadas);
   let materias: MateriaInfo[] = [];
 
   try {
@@ -262,7 +347,7 @@ export async function getMaterias(incluirArchivadas = false, forzarRefresco = fa
     materias = parseMateriasFromHtml(html);
   }
 
-  if (materias.length > 0) {
+  if (materias.length > 0 && gen === evaGeneration) {
     materiasCache.set(cacheKey, { data: materias, expires: Date.now() + CACHE_TTL_MS });
     if (!incluirArchivadas) {
       const session = loadEncryptedSession();
@@ -278,13 +363,18 @@ export async function getMaterias(incluirArchivadas = false, forzarRefresco = fa
 
 const contenidoInflight = new Map<number, Promise<SeccionCurso[]>>();
 
-// Carga las secciones de un curso deduplicando llamadas simultáneas (precarga de arranque + herramienta)
+// Carga las secciones de un curso: caché de contenido (5 min) y deduplicación de llamadas simultáneas
 function cargarSeccionesCurso(cursoId: number, forzarRefresco: boolean): Promise<SeccionCurso[]> {
-  const pending = contenidoInflight.get(cursoId);
-  if (pending && !forzarRefresco) return pending;
+  if (!forzarRefresco) {
+    const cached = contenidoCache.get(cursoId);
+    if (cached && Date.now() < cached.expires) return Promise.resolve(cached.data);
+    const pending = contenidoInflight.get(cursoId);
+    if (pending) return pending;
+  }
+  const gen = evaGeneration;
   const p = cargarSeccionesCursoSinCache(cursoId)
     .then((secciones) => {
-      if (secciones.length > 0) {
+      if (secciones.length > 0 && gen === evaGeneration) {
         contenidoCache.set(cursoId, { data: secciones, expires: Date.now() + CACHE_TTL_MS });
       }
       return secciones;
@@ -341,13 +431,7 @@ export async function getContenidoCurso(
   filtroTipo?: string,
   seccionId?: number
 ): Promise<SeccionCurso[]> {
-  if (!forzarRefresco && !filtroTipo && seccionId === undefined) {
-    const cached = contenidoCache.get(cursoId);
-    if (cached && Date.now() < cached.expires) {
-      return cached.data;
-    }
-  }
-
+  // Los filtros se aplican en memoria sobre el contenido cacheado (misma consulta de red para cualquier filtro)
   const secciones = await cargarSeccionesCurso(cursoId, forzarRefresco);
 
   let result = secciones;
@@ -381,6 +465,7 @@ export async function getTareasYNotas(
     }
   }
 
+  const gen = evaGeneration;
   const nowUnix = Math.floor(Date.now() / 1000);
   const timesortfrom = incluirCerradas ? 0 : nowUnix - 86400;
   // Acotar la ventana: sin límite superior Moodle devuelve eventos de años futuros (cientos de KB, >10 s)
@@ -395,18 +480,33 @@ export async function getTareasYNotas(
   // deshabilitados en EVA). Se consultan en paralelo con las materias activas.
   const eventosTask = (async () => {
     try {
-      const data = cursoId
-        ? await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_course", {
-            courseid: cursoId,
-            timesortfrom,
-            ...(timesortto ? { timesortto } : {})
-          })
-        : await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_timesort", {
-            timesortfrom,
-            ...(timesortto ? { timesortto } : {}),
-            limitnum: 50
-          });
-      return data?.events ?? [];
+      if (cursoId) {
+        const data = await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_course", {
+          courseid: cursoId,
+          timesortfrom,
+          ...(timesortto ? { timesortto } : {}),
+          limitnum: 50
+        });
+        return data?.events ?? [];
+      }
+      // Sin curso: eventos ordenados por fecha, paginados (hasta 5 páginas de 50) para no quedarse solo con los más viejos
+      const PAGE = 50;
+      const all: any[] = [];
+      let afterId: number | undefined;
+      for (let page = 0; page < (incluirCerradas ? 5 : 2); page++) {
+        const data = await evaAjaxRpc<{ events: any[] }>("core_calendar_get_action_events_by_timesort", {
+          timesortfrom,
+          ...(timesortto ? { timesortto } : {}),
+          limitnum: PAGE,
+          ...(afterId !== undefined ? { aftereventid: afterId } : {})
+        });
+        const evs = data?.events ?? [];
+        all.push(...evs);
+        if (evs.length < PAGE) break;
+        afterId = evs[evs.length - 1]?.id;
+        if (afterId === undefined) break;
+      }
+      return all;
     } catch (err) {
       if (!(err instanceof SessionExpiredError)) logger.error(`No se pudieron obtener eventos de calendario en EVA: ${err}`);
       throw err;
@@ -510,20 +610,28 @@ export async function getTareasYNotas(
       const gradeHtml = await gradePage!;
       const $g = cheerio.load(gradeHtml);
 
+      const normT = (t: string) => normalizeMateria(t);
+      const vistos = new Set<string>();
       $g("table.user-grade tbody tr").each((_, tr) => {
-        let itemName = $g(tr).find(".itemname, th").first().text().replace(/\s+/g, " ").trim();
-        itemName = itemName.replace(/^(Tarea|Cuestionario|Foro|Taller|Lección)/i, "").trim();
+        // Nombre sin el texto del icono del tipo de actividad ("Tarea", "Foro"...)
+        const celda = $g(tr).find(".itemname, th").first().clone();
+        const teniaIcono = celda.find("img, .icon, .accesshide, .sr-only").length > 0;
+        celda.find("img, .icon, .accesshide, .sr-only").remove();
+        const nombreLimpio = celda.text().replace(/\s+/g, " ").trim();
+        // Sin icono, el tipo puede venir pegado como palabra completa ("Tarea Entrega 1"); "Tarea 3 integradora" no se toca
+        const sinTipo = teniaIcono ? nombreLimpio : nombreLimpio.replace(/^(?:Tarea|Cuestionario|Foro|Taller|Lecci[oó]n)\s+(?!\d)(?=\S)/i, "").trim();
+        const itemName = sinTipo || nombreLimpio;
         const rawGrade = $g(tr).find(".grade, td.column-grade").first().text().replace(/\s+/g, " ").trim();
         const rawRange = $g(tr).find(".range, td.column-range").first().text().replace(/\s+/g, " ").trim();
 
-        if (!itemName || itemName === "&nbsp;" || itemName.includes("Total del curso")) return;
+        if (!itemName || itemName === "&nbsp;" || /total del curso|total de (?:la )?categor[ií]a|^total\b/i.test(itemName)) return;
 
         const cleanGrade = rawGrade.split(" ")[0].trim();
         const hasNota = cleanGrade && cleanGrade !== "-";
 
-        // Matching estricto por igualdad exacta (evita "TP 1" coincidiendo erróneamente con "TP 10")
-        const targetNameLower = itemName.toLowerCase();
-        const match = tareas.find((t) => t.nombre.toLowerCase() === targetNameLower);
+        // Matching estricto por igualdad normalizada (evita "TP 1" coincidiendo con "TP 10"); se prueba con y sin prefijo de tipo
+        const candidatos = new Set([normT(itemName), normT(nombreLimpio)]);
+        const match = tareas.find((t) => candidatos.has(normT(t.nombre)));
 
         if (match) {
           if (hasNota) {
@@ -531,9 +639,10 @@ export async function getTareasYNotas(
             match.estadoEntrega = "Calificada";
           }
           if (rawRange) match.rangoCalificacion = rawRange;
-        } else if (incluirCerradas || hasNota) {
+        } else if ((incluirCerradas || hasNota) && !vistos.has(normT(itemName))) {
+          vistos.add(normT(itemName));
           tareas.push({
-            id: tareas.length + 1000,
+            id: idSintetico("nota", cursoId, itemName),
             cmid: 0,
             nombre: itemName,
             materiaId: cursoId,
@@ -560,7 +669,7 @@ export async function getTareasYNotas(
     return a.fechaLimiteUnix - b.fechaLimiteUnix;
   });
 
-  tareasCache.set(cacheKey, { data: tareas, expires: Date.now() + TAREAS_CACHE_TTL_MS });
+  if (gen === evaGeneration) tareasCache.set(cacheKey, { data: tareas, expires: Date.now() + TAREAS_CACHE_TTL_MS });
   return tareas;
 }
 
@@ -572,12 +681,15 @@ export async function getForos(cursoId?: number, limit = 10, forzarRefresco = fa
 async function getForosSinCache(cursoId?: number, limit = 10): Promise<ForoItem[]> {
   const targetCursos: Array<{ id: number; nombre?: string }> = cursoId
     ? [{ id: cursoId }]
-    : await getMaterias();
+    : await getCursosActivos();
 
-  // Scraping paralelo (mod_forum_get_forums_by_courses / mod_forum_get_forum_discussions están deshabilitados en EVA): hasta 4 cursos, 1 foro de avisos por curso; reutiliza el contenido cacheado
+  // Scraping paralelo acotado (mod_forum_get_forums_by_courses / mod_forum_get_forum_discussions están deshabilitados en EVA): todos los cursos activos, 1 foro de avisos por curso; reutiliza el contenido cacheado
   const items: ForoItem[] = [];
-  const courseResults = await Promise.all(
-    targetCursos.slice(0, 4).map(async (curso) => {
+  const fallidos: string[] = [];
+  const courseResults = await mapLimit(
+    targetCursos,
+    4,
+    async (curso) => {
       const courseItems: ForoItem[] = [];
       try {
         const secciones = await getContenidoCurso(curso.id);
@@ -640,16 +752,28 @@ async function getForosSinCache(cursoId?: number, limit = 10): Promise<ForoItem[
       } catch (err) {
         if (err instanceof SessionExpiredError) throw err;
         logger.warn(`No se pudieron sincronizar foros para el curso ${curso.id}: ${err}`);
+        fallidos.push(curso.nombre || `curso ${curso.id}`);
       }
       return courseItems;
-    })
+    }
   );
 
   items.push(...courseResults.flat());
-  return items.slice(0, limit);
+  const resultado = items.slice(0, limit);
+  if (fallidos.length > 0) {
+    resultado.unshift({
+      id: 0,
+      asunto: "[Aviso] Algunas materias no se pudieron consultar",
+      autor: "UCA MCP",
+      fecha: "Ahora",
+      mensaje: `No se pudieron leer los avisos de: ${fallidos.join(", ")}. Reintentá en unos minutos.`
+    });
+  }
+  return resultado;
 }
 
 // 4b. Obtener hilo completo de una discusión de foro (incluyendo todas las respuestas)
+const MAX_POSTS_HILO = 100;
 export async function getHiloForo(discusionId: number): Promise<HiloForoResult> {
   // 1. Intento por servicio oficial RPC Moodle
   try {
@@ -676,11 +800,11 @@ export async function getHiloForo(discusionId: number): Promise<HiloForoResult> 
           parentId: p.parentid && p.parentid > 0 ? p.parentid : undefined,
           asunto: (p.subject || "Respuesta").replace(/[\r\n<>]/g, " ").trim(),
           autor,
-          fecha: timestamp ? new Date(timestamp * 1000).toLocaleString("es-AR") : "Reciente",
+          fecha: timestamp ? new Date(timestamp * 1000).toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" }) : "Reciente",
           mensaje: wrapUntrustedContent(capSnippet(rawText, 1500), `eva_post_${p.id}`)
         };
       });
-      return { discusionId, totalPosts: posts.length, posts };
+      return { discusionId, totalPosts: posts.length, posts: posts.slice(0, MAX_POSTS_HILO) };
     }
   } catch (err) {
     if (err instanceof SessionExpiredError) throw err;
@@ -699,7 +823,7 @@ export async function getHiloForo(discusionId: number): Promise<HiloForoResult> 
     const fecha = $(el).find(".time, .posttime, time, .mb-3, .date").first().text().trim() || "Reciente";
     const rawMensaje = $(el).find(".post-content, .message, .content, .post-content-container, .text_to_html, .post-message").first().text().trim() || "";
     const idAttr = $(el).attr("id") || "";
-    const id = parseInt(idAttr.replace(/\D/g, ""), 10) || 1;
+    const id = parseInt(idAttr.replace(/\D/g, ""), 10) || idSintetico("post", rawAsunto, fecha, rawAutor);
 
     posts.push({
       id,
@@ -723,7 +847,7 @@ export async function getHiloForo(discusionId: number): Promise<HiloForoResult> 
     );
   }
 
-  return { discusionId, totalPosts: posts.length, posts };
+  return { discusionId, totalPosts: posts.length, posts: posts.slice(0, MAX_POSTS_HILO) };
 }
 
 // 5. Búsqueda de materiales y consignas (paralelizada por lotes sin saturar EVA)
@@ -801,13 +925,14 @@ export interface CuestionarioInfo {
   };
 }
 
-// 6. Obtener cuestionarios online y exámenes parciales de EVA Moodle (Lectura pura - sin interactuar con respuestas)
+// 6. Obtener cuestionarios online y exámenes parciales de EVA (Lectura pura - sin interactuar con respuestas)
 export async function getCuestionarios(cursoId?: number, forzarRefresco = false): Promise<CuestionarioInfo[]> {
   return ttlCached(`quiz:${cursoId ?? "all"}`, 60_000, forzarRefresco, () => getCuestionariosSinCache(cursoId));
 }
 
 async function getCuestionariosSinCache(cursoId?: number): Promise<CuestionarioInfo[]> {
   const candidateQuizzes: Array<{ cmid: number; nombre: string; cursoId?: number; cursoNombre?: string; url: string }> = [];
+  let fallosCursos: string[] = [];
 
   if (cursoId) {
     const secciones = await getContenidoCurso(cursoId);
@@ -827,8 +952,8 @@ async function getCuestionariosSinCache(cursoId?: number): Promise<CuestionarioI
     // Contenido de las materias activas en paralelo con el calendario: solo se usa si el calendario no trae cuestionarios
     // (getContenidoCurso cachea el resultado, así que el bucle posterior no genera red)
     const contenidoTask = (async () => {
-      const activeCourses = (await getMaterias(false)).slice(0, 4);
-      await Promise.allSettled(activeCourses.map((c) => getContenidoCurso(c.id)));
+      const activeCourses = await getCursosActivos();
+      await mapLimit(activeCourses, 4, (c) => getContenidoCurso(c.id).catch(() => undefined));
       return activeCourses;
     })();
     contenidoTask.catch(() => {});
@@ -871,12 +996,15 @@ async function getCuestionariosSinCache(cursoId?: number): Promise<CuestionarioI
               }
             }
           }
-        } catch {}
+        } catch (err) {
+          if (err instanceof SessionExpiredError) throw err;
+          fallosCursos.push(c.nombre);
+        }
       }
     }
   }
 
-  const results = await Promise.all(
+  const results: CuestionarioInfo[] = await Promise.all(
     candidateQuizzes.slice(0, 10).map(async (q) => {
       try {
         const res = await evaFetch(`/mod/quiz/view.php?id=${q.cmid}`);
@@ -889,26 +1017,24 @@ async function getCuestionariosSinCache(cursoId?: number): Promise<CuestionarioI
         const intentosMatch = /Intentos permitidos:\s*(\d+)/i.exec(text);
         const califAprobarMatch = /Calificaci[oó]n para aprobar:\s*([\d,.]+)/i.exec(text);
 
-        let ultimoIntento: CuestionarioInfo["ultimoIntento"] = undefined;
+        // Se acumulan los campos de todas las filas (Moodle los reparte en filas distintas: Estado, Comenzado el, Finalizado en...)
         let estadoIntentoTexto = "";
+        const intento: { comenzado?: string; completado?: string; duracion?: string } = {};
         $("table.quizreviewsummary tr, table.generaltable tr").each((_, tr) => {
           const rowText = $(tr).text().replace(/\s+/g, " ").trim();
-          if (/Estado\s+Finalizado/i.test(rowText)) estadoIntentoTexto = "Finalizado";
-          else if (/Estado\s+En curso/i.test(rowText)) estadoIntentoTexto = "En curso";
+          const est = /(?:^|\s)Estado\s+(Finalizado|En curso|Sin terminar|Abandonado)/i.exec(rowText);
+          if (est) estadoIntentoTexto = /^en curso|^sin terminar/i.test(est[1]) ? "En curso" : /^abandonado/i.test(est[1]) ? "Abandonado" : "Finalizado";
 
-          const comMatch = /Comenzado\s+([^,]+,\s*\d+[^,]+,\s*\d{1,2}:\d{2})/i.exec(rowText);
-          const compMatch = /Completado\s+([^,]+,\s*\d+[^,]+,\s*\d{1,2}:\d{2})/i.exec(rowText);
-          const durMatch = /Duraci[oó]n\s+([\w\s]+)/i.exec(rowText);
-
-          if (estadoIntentoTexto) {
-            ultimoIntento = {
-              estado: estadoIntentoTexto,
-              comenzado: comMatch?.[1]?.trim(),
-              completado: compMatch?.[1]?.trim(),
-              duracion: durMatch?.[1]?.trim()
-            };
-          }
+          const com = /^Comenzado(?:\s+el)?\s+(.+)$/i.exec(rowText);
+          const comp = /^(?:Finalizado\s+en|Completado(?:\s+el)?)\s+(.+)$/i.exec(rowText);
+          const dur = /^(?:Tiempo\s+empleado|Duraci[oó]n)\s+(.+)$/i.exec(rowText);
+          if (com && !intento.comenzado) intento.comenzado = com[1].trim();
+          if (comp && !intento.completado) intento.completado = comp[1].trim();
+          if (dur && !intento.duracion) intento.duracion = dur[1].trim();
         });
+        const ultimoIntento: CuestionarioInfo["ultimoIntento"] = estadoIntentoTexto
+          ? { estado: estadoIntentoTexto, ...intento }
+          : undefined;
 
         let estado: CuestionarioInfo["estado"] = "Pendiente";
         if (estadoIntentoTexto === "Finalizado") {
@@ -949,6 +1075,15 @@ async function getCuestionariosSinCache(cursoId?: number): Promise<CuestionarioI
     })
   );
 
+  if (fallosCursos.length > 0) {
+    results.unshift({
+      id: 0,
+      cmid: 0,
+      nombre: `[Aviso] No se pudieron consultar los cuestionarios de: ${fallosCursos.join(", ")}`,
+      url: CONFIG.EVA_BASE_URL,
+      estado: "Pendiente" as const
+    });
+  }
   return results;
 }
 
@@ -962,6 +1097,9 @@ export interface CronogramaMateriaResult {
     tipo: string;
   };
   lineasEvaluacion?: string[];
+  fechasDetectadas?: string[];
+  avisoFechas?: string;
+  candidatos?: Array<{ nombre: string; id: number; tipo: string }>;
   textoCronograma?: string;
   evaluacionesAula?: Array<{
     nombre: string;
@@ -969,6 +1107,235 @@ export interface CronogramaMateriaResult {
     url?: string;
   }>;
   mensaje: string;
+}
+
+// ---- Caché cifrada de cronogramas (por usuario y por materia) ----
+const CRONO_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const CRONO_SIN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MENSAJE_SIN_CRONOGRAMA = "Esta materia no tiene cronograma publicado en EVA (no es un error: el aula virtual no incluye ni cronograma ni programa).";
+
+interface CronoCacheEntry {
+  v: 2;
+  savedAt: number;
+  sinCronograma: boolean;
+  result: CronogramaMateriaResult;
+}
+
+function cronoCachePath(cursoId: number): string {
+  return path.join(CONFIG.CACHE_DIR, `crono-${getSessionUserKey()}-${cursoId}.enc`);
+}
+
+function leerCronoCache(cursoId: number): CronogramaMateriaResult | null {
+  try {
+    const file = cronoCachePath(cursoId);
+    if (!fs.existsSync(file)) return null;
+    const raw = fs.readFileSync(file);
+    if (raw.length < 28) return null;
+    const decipher = crypto.createDecipheriv("aes-256-gcm", getOrCreateMasterKey(), raw.subarray(0, 12));
+    decipher.setAuthTag(raw.subarray(12, 28));
+    const plain = Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString("utf8");
+    const entry = JSON.parse(plain) as CronoCacheEntry;
+    if (entry?.v !== 2 || !entry.result) return null;
+    const ttl = entry.sinCronograma ? CRONO_SIN_TTL_MS : CRONO_TTL_MS;
+    if (Date.now() - entry.savedAt > ttl) {
+      try { fs.unlinkSync(file); } catch {}
+      return null;
+    }
+    return entry.result;
+  } catch {
+    return null;
+  }
+}
+
+function guardarCronoCache(cursoId: number, result: CronogramaMateriaResult): void {
+  try {
+    if (!fs.existsSync(CONFIG.CACHE_DIR)) fs.mkdirSync(CONFIG.CACHE_DIR, { recursive: true, mode: 0o700 });
+    const entry: CronoCacheEntry = { v: 2, savedAt: Date.now(), sinCronograma: !result.encontrado, result };
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", getOrCreateMasterKey(), iv);
+    const enc = Buffer.concat([cipher.update(Buffer.from(JSON.stringify(entry), "utf8")), cipher.final()]);
+    fs.writeFileSync(cronoCachePath(cursoId), Buffer.concat([iv, cipher.getAuthTag(), enc]));
+  } catch {}
+}
+
+function purgarCronogramasEnDisco(): void {
+  try {
+    if (!fs.existsSync(CONFIG.CACHE_DIR)) return;
+    for (const f of fs.readdirSync(CONFIG.CACHE_DIR)) {
+      if (f.startsWith("crono-")) {
+        try { fs.unlinkSync(path.join(CONFIG.CACHE_DIR, f)); } catch {}
+      }
+    }
+  } catch {}
+}
+
+type ModuloCurso = { id: number; nombre: string; tipo: string; url?: string };
+
+// Extrae el texto de un recurso de EVA (archivo descargable o página); null si no se pudo leer
+async function extraerTextoModulo(mod: ModuloCurso): Promise<{ texto: string; nombre: string; tipo: string; url: string } | null> {
+  if (mod.tipo === "page") {
+    const pagina = await getPaginaEva(mod.id);
+    if (!pagina?.texto) return null;
+    return { texto: pagina.texto, nombre: pagina.titulo || mod.nombre, tipo: "text/html", url: mod.url || `${CONFIG.EVA_BASE_URL}/mod/page/view.php?id=${mod.id}` };
+  }
+  if (!mod.url) return null;
+  const file = await downloadSecureFile(mod.url, 0, false, CRONO_TTL_MS);
+  const fname = file.filename.toLowerCase();
+  let fullText = "";
+  if (fname.endsWith(".pdf") || file.mimeType.includes("pdf")) {
+    const pdfRes = await extractPdfContent(file.buffer);
+    fullText = pdfRes.blocks.filter((b) => b.type === "text" && b.text).map((b) => b.text).join("\n");
+  } else if (fname.endsWith(".docx")) {
+    fullText = await extractDocxText(file.buffer);
+  } else if (fname.endsWith(".pptx")) {
+    fullText = await extractPptxText(file.buffer);
+  } else if (fname.endsWith(".xlsx")) {
+    fullText = await extractXlsxText(file.buffer);
+  } else if (fname.endsWith(".odt") || fname.endsWith(".ods")) {
+    fullText = await extractOdfText(file.buffer);
+  } else if (fname.endsWith(".txt") || fname.endsWith(".csv") || file.mimeType.startsWith("text/")) {
+    fullText = new TextDecoder("utf-8", { fatal: false }).decode(file.buffer);
+  } else {
+    return null;
+  }
+  if (!fullText.trim()) return null;
+  return { texto: fullText, nombre: file.filename || mod.nombre, tipo: file.mimeType, url: mod.url };
+}
+
+// Busca y procesa el cronograma/programa de un curso. `definitivo` es false si hubo un error transitorio (no se cachea)
+async function buscarCronogramaEnCurso(course: MateriaInfo): Promise<{ res: CronogramaMateriaResult; definitivo: boolean }> {
+  const secciones = await getContenidoCurso(course.id);
+  // Solo archivos/recursos o páginas: un foro o una tarea llamados "Cronograma" no son el documento buscado
+  const esDocumento = (m: ModuloCurso) => m.tipo === "resource" || m.tipo === "recurso" || m.tipo === "page";
+
+  // Puntaje por nombre: prioriza programa/cronograma y penaliza prácticos, guías y clases
+  const puntuar = (nombre: string, secIdx: number): number => {
+    const n = nombre.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    let sc = 0;
+    if (/cronograma/.test(n)) sc += 10;
+    if (/\bprograma\b|syllabus/.test(n)) sc += 9;
+    if (/plan\s+de\s+(?:la\s+)?(?:asignatura|catedra|materia)|planificacion/.test(n)) sc += 8;
+    if (/fechas\s+de\s+(?:parcial|examen|cursada|evaluacion)/.test(n)) sc += 8;
+    if (/calendario\s+(?:academico|de\s+clases?|de\s+evaluaciones?|de\s+parciales?|de\s+examenes)/.test(n)) sc += 8;
+    else if (/calendario/.test(n)) sc += 3;
+    if (/practic|\btps?\b|trabajo\s+practico|guia|ejercicio|apunte|\bclase\s*(?:n[°º.]?\s*)?\d+/.test(n)) sc -= 8;
+    if (sc > 0) sc += secIdx <= 1 ? 2 : secIdx <= 3 ? 1 : 0;
+    return sc;
+  };
+
+  const puntuados: Array<{ mod: ModuloCurso; score: number }> = [];
+  secciones.forEach((sec, secIdx) => {
+    for (const mod of sec.modulos) {
+      if (!esDocumento(mod)) continue;
+      const score = puntuar(mod.nombre, secIdx);
+      if (score > -100) puntuados.push({ mod, score });
+    }
+  });
+  puntuados.sort((x, y) => y.score - x.score);
+  const UMBRAL = 6;
+
+  let definitivo = true;
+  const candidatos = puntuados.filter((p) => p.score >= UMBRAL).slice(0, 3).map((p) => p.mod);
+  for (const targetMod of candidatos) {
+    try {
+      const doc = await extraerTextoModulo(targetMod);
+      if (!doc) continue; // formato no soportado o vacío: probar la alternativa
+      const lineas = doc.texto.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const evalRegex = /parcial|recuperat|coloquio|entrega|evaluaci[oó]n|tp\s*obligatorio|examen|fecha\s+l[ií]mite/i;
+      const lineasEvaluacion = lineas.filter((l) => evalRegex.test(l));
+      const fechaRegex = /\b\d{1,2}\s*[\/-]\s*\d{1,2}(?:\s*[\/-]\s*\d{2,4})?\b|\b\d{1,2}\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/i;
+      const fechasDetectadas: string[] = [];
+      lineas.forEach((l, i) => {
+        if (!fechaRegex.test(l)) return;
+        const cerca = [lineas[i - 1], l, lineas[i + 1]].filter(Boolean).join(" ");
+        if (evalRegex.test(cerca) && fechasDetectadas.length < 40) fechasDetectadas.push(l.slice(0, 240));
+      });
+      const avisoFechas = fechasDetectadas.length === 0
+        ? `El documento '${doc.nombre}' ${lineasEvaluacion.length > 0 ? `menciona evaluaciones (${lineasEvaluacion.length} líneas) pero ` : ""}no publica fechas concretas de parciales, recuperatorios o entregas; consultá eva_entregas_proximas / eva_cuestionarios o al docente.`
+        : undefined;
+      const textoCronograma =
+        doc.texto.length <= 4000 ? doc.texto : doc.texto.slice(0, 3000) + "\n\n[...]\n" + lineasEvaluacion.join("\n");
+      return {
+        definitivo: true,
+        res: {
+          encontrado: true,
+          materia: course.nombre,
+          cursoId: course.id,
+          archivo: { nombre: doc.nombre, url: doc.url, tipo: doc.tipo },
+          lineasEvaluacion,
+          fechasDetectadas,
+          avisoFechas,
+          textoCronograma,
+          mensaje: `Cronograma/programa de '${course.nombre}' encontrado exitosamente (${doc.nombre}).`
+        }
+      };
+    } catch (err) {
+      if (err instanceof SessionExpiredError) throw err;
+      definitivo = false;
+      logger.warn(`No se pudo descargar o extraer texto de '${targetMod.nombre}': ${err}`);
+    }
+  }
+
+  // Si no hay archivo descargable, verificar si hay módulos directos de evaluación (quizzes / assigns)
+  const evaluacionesAula: Array<{ nombre: string; tipo: string; url?: string }> = [];
+  for (const sec of secciones) {
+    for (const mod of sec.modulos) {
+      if ((mod.tipo === "quiz" || mod.tipo === "assign") && /parcial|recuperat|coloquio|evaluaci/i.test(mod.nombre)) {
+        evaluacionesAula.push({ nombre: mod.nombre, tipo: mod.tipo, url: mod.url });
+      }
+    }
+  }
+
+  // Sin un candidato claro: devolver la lista para que el alumno/modelo elija en vez de leer un archivo equivocado
+  const ambiguos = puntuados.filter((p) => p.score > 0 && p.score < UMBRAL).slice(0, 8).map((p) => ({ nombre: p.mod.nombre, id: p.mod.id, tipo: p.mod.tipo }));
+  if (candidatos.length === 0 && ambiguos.length > 0) {
+    return {
+      definitivo,
+      res: {
+        encontrado: false,
+        materia: course.nombre,
+        cursoId: course.id,
+        candidatos: ambiguos,
+        evaluacionesAula: evaluacionesAula.length > 0 ? evaluacionesAula : undefined,
+        mensaje: `No hay un cronograma/programa claro en '${course.nombre}'. Archivos posibles (nombre + id): elegí uno y leelo con eva_leer_archivo/eva_contenido_curso, o consultá al docente.`
+      }
+    };
+  }
+
+  if (evaluacionesAula.length > 0) {
+    return {
+      definitivo,
+      res: {
+        encontrado: true,
+        materia: course.nombre,
+        cursoId: course.id,
+        evaluacionesAula,
+        mensaje: `No se encontró un documento adjunto de cronograma/programa en '${course.nombre}', pero se detectaron ${evaluacionesAula.length} actividades de evaluación en el aula virtual.`
+      }
+    };
+  }
+
+  if (!definitivo) {
+    return {
+      definitivo: false,
+      res: {
+        encontrado: false,
+        materia: course.nombre,
+        cursoId: course.id,
+        mensaje: `Se encontró un cronograma/programa en '${course.nombre}' pero no se pudo leer en este momento. Reintentá en unos minutos.`
+      }
+    };
+  }
+
+  return {
+    definitivo: true,
+    res: {
+      encontrado: false,
+      materia: course.nombre,
+      cursoId: course.id,
+      mensaje: MENSAJE_SIN_CRONOGRAMA.replace("Esta materia", `La materia '${course.nombre}'`)
+    }
+  };
 }
 
 // 7. Buscar cronograma o programa de una materia y extraer fechas de parciales y recuperatorios
@@ -997,109 +1364,62 @@ export async function getCronogramaMateria(materia: string): Promise<CronogramaM
   if (!course) {
     return {
       encontrado: false,
-      mensaje: `No hay cronograma ni programa disponible en el aula virtual de '${materia}' (no se encontró la materia entre los cursos de EVA Moodle).`
+      mensaje: `No hay cronograma ni programa disponible en el aula virtual de '${materia}' (no se encontró la materia entre los cursos de EVA).`
     };
   }
 
-  const secciones = await getContenidoCurso(course.id);
-  let cronogramaMod: { id: number; nombre: string; tipo: string; url?: string } | undefined;
-  let programaMod: { id: number; nombre: string; tipo: string; url?: string } | undefined;
+  // Primero la caché precargada: responde sin red
+  const enCache = leerCronoCache(course.id);
+  if (enCache) return enCache;
 
-  for (const sec of secciones) {
-    for (const mod of sec.modulos) {
-      const nom = mod.nombre.toLowerCase();
-      if (!cronogramaMod && /cronograma|calendario|fechas\s+de\s+(?:parcial|examen|cursada)/i.test(nom)) {
-        cronogramaMod = mod;
-      } else if (!programaMod && /\bprograma\b|planificaci[oó]n/i.test(nom)) {
-        programaMod = mod;
-      }
+  const { res, definitivo } = await buscarCronogramaEnCurso(course);
+  if (definitivo) guardarCronoCache(course.id, res);
+  return res;
+}
+
+// ---- Precarga en segundo plano de los cronogramas de las materias en curso ----
+let precargaProgramada = false;
+let precargaCorriendo = false;
+let precargaHecha = false;
+
+// Descarga y cachea (cifrado) el cronograma de cada materia en curso. Nunca lanza; una sola vez por sesión.
+export async function precargarCronogramas(): Promise<void> {
+  if (precargaCorriendo || precargaHecha) return;
+  precargaCorriendo = true;
+  const gen = evaGeneration;
+  try {
+    if (!loadEncryptedSession()) {
+      precargaProgramada = false;
+      return;
     }
-  }
-
-  const targetMod = cronogramaMod || programaMod;
-
-  if (targetMod && targetMod.url) {
-    try {
-      const file = await downloadSecureFile(targetMod.url);
-      let fullText = "";
-
-      if (file.filename.endsWith(".pdf") || file.mimeType.includes("pdf")) {
-        const pdfRes = await extractPdfContent(file.buffer);
-        fullText = pdfRes.blocks
-          .filter((b) => b.type === "text" && b.text)
-          .map((b) => b.text)
-          .join("\n");
-      } else if (file.filename.toLowerCase().endsWith(".docx")) {
-        fullText = await extractDocxText(file.buffer);
-      } else if (file.filename.toLowerCase().endsWith(".pptx")) {
-        fullText = await extractPptxText(file.buffer);
-      } else if (file.filename.toLowerCase().endsWith(".xlsx")) {
-        fullText = await extractXlsxText(file.buffer);
-      } else if (file.filename.toLowerCase().endsWith(".odt") || file.filename.toLowerCase().endsWith(".ods")) {
-        fullText = await extractOdfText(file.buffer);
-      } else if (file.filename.toLowerCase().endsWith(".txt") || file.filename.toLowerCase().endsWith(".csv") || file.mimeType.startsWith("text/")) {
-        fullText = new TextDecoder("utf-8", { fatal: false }).decode(file.buffer);
-      } else {
-        fullText = `[Formato no soportado para extracción directa de texto: ${file.filename}]`;
+    const cursos = await getCursosActivos();
+    await mapLimit(cursos, 2, async (curso) => {
+      try {
+        if (gen !== evaGeneration || leerCronoCache(curso.id)) return;
+        const { res, definitivo } = await buscarCronogramaEnCurso(curso);
+        if (definitivo && gen === evaGeneration) guardarCronoCache(curso.id, res);
+      } catch (err) {
+        logger.warn(`Precarga de cronograma omitida para '${curso.nombre}': ${err}`);
       }
-
-      const lineas = fullText
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter(Boolean);
-
-      const evalRegex = /parcial|recuperat|coloquio|entrega|evaluaci[oó]n|tp\s*obligatorio|examen\s+final|fecha\s+l[ií]mite/i;
-      const lineasEvaluacion = lineas.filter((l) => evalRegex.test(l));
-
-      const textoCronograma =
-        fullText.length <= 4000
-          ? fullText
-          : fullText.slice(0, 3000) + "\n\n[...]\n" + lineasEvaluacion.join("\n");
-
-      return {
-        encontrado: true,
-        materia: course.nombre,
-        cursoId: course.id,
-        archivo: {
-          nombre: file.filename || targetMod.nombre,
-          url: targetMod.url,
-          tipo: file.mimeType
-        },
-        lineasEvaluacion,
-        textoCronograma,
-        mensaje: `Cronograma/programa de '${course.nombre}' encontrado exitosamente (${file.filename || targetMod.nombre}).`
-      };
-    } catch (err) {
-      logger.warn(`No se pudo descargar o extraer texto de '${targetMod.nombre}': ${err}`);
-    }
+    });
+    if (gen === evaGeneration) precargaHecha = true;
+  } catch (err) {
+    // Sin sesión válida o EVA caído: se permite reintentar en un próximo disparo
+    precargaProgramada = false;
+    logger.warn(`Precarga de cronogramas no completada: ${err}`);
+  } finally {
+    precargaCorriendo = false;
   }
+}
 
-  // Si no hay archivo descargable, verificar si hay módulos directos de evaluación (quizzes / assigns)
-  const evaluacionesAula: Array<{ nombre: string; tipo: string; url?: string }> = [];
-  for (const sec of secciones) {
-    for (const mod of sec.modulos) {
-      if ((mod.tipo === "quiz" || mod.tipo === "assign") && /parcial|recuperat|coloquio|evaluaci/i.test(mod.nombre)) {
-        evaluacionesAula.push({ nombre: mod.nombre, tipo: mod.tipo, url: mod.url });
-      }
-    }
-  }
-
-  if (evaluacionesAula.length > 0) {
-    return {
-      encontrado: true,
-      materia: course.nombre,
-      cursoId: course.id,
-      evaluacionesAula,
-      mensaje: `No se encontró un documento adjunto de cronograma/programa en '${course.nombre}', pero se detectaron ${evaluacionesAula.length} actividades de evaluación en el aula virtual.`
-    };
-  }
-
-  return {
-    encontrado: false,
-    materia: course.nombre,
-    cursoId: course.id,
-    mensaje: `No hay cronograma ni programa disponible en el aula virtual de '${course.nombre}'.`
-  };
+// Programa la precarga unos segundos después (sin bloquear nada). Idempotente.
+export function programarPrecargaCronogramas(delayMs = 5000): void {
+  if (precargaProgramada || precargaHecha) return;
+  precargaProgramada = true;
+  const t = setTimeout(() => {
+    precargarCronogramas().catch(() => {});
+  }, delayMs);
+  t.unref?.();
 }
 
 export interface EntregaProximaItem {

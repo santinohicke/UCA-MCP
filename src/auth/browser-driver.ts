@@ -268,7 +268,7 @@ export async function silentRefreshGuarani(): Promise<boolean> {
   }
 }
 
-// Refresca de forma silenciosa la sesión de EVA Moodle en segundo plano usando el perfil persistente con KMSI
+// Refresca de forma silenciosa la sesión de EVA en segundo plano usando el perfil persistente con KMSI
 export async function silentRefreshEva(): Promise<boolean> {
   if (evaRefreshPromise) return evaRefreshPromise;
 
@@ -290,7 +290,7 @@ export async function silentRefreshEva(): Promise<boolean> {
     try {
       const { chromium } = await import("playwright-core");
       const channel = await getAvailableChannel();
-      logger.info(`Iniciando refresh silencioso de EVA Moodle en segundo plano con ${channel}...`);
+      logger.info(`Iniciando refresh silencioso de EVA en segundo plano con ${channel}...`);
 
       registerExitCleanupOnce();
       const context = await chromium.launchPersistentContext(
@@ -693,7 +693,7 @@ async function executeInteractiveLogin(): Promise<void> {
               if (!siuSession) {
                 console.log(" [AVISO] Guaraní no pudo sincronizarse por completo. Podés volver a correr 'login' si necesitás finales.");
               } else {
-                console.log(" EVA Moodle y SIU Guaraní vinculados correctamente.");
+                console.log(" EVA y SIU Guaraní vinculados correctamente.");
               }
               console.log(" Ya podés cerrar el navegador y comenzar a usar el MCP.");
               console.log("==================================================");

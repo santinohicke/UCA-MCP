@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "../config.js";
+import { getSessionUserKey, registerSessionPurgeHook } from "../auth/session.js";
 import { SessionExpiredError } from "../shared/http.js";
 import { getArancelesYTramites } from "../campus/client.js";
 import { getTareasYNotas, getForos, type TareaInfo, type ForoItem } from "../eva/client.js";
@@ -8,6 +9,7 @@ import {
   getEstadoCursada,
   getHorarioSemanal,
   getMisInscripcionesExamen,
+  withGuaraniLock,
   type CursadaInfo,
   type ClaseHorario,
   type MesaExamenInfo
@@ -34,6 +36,8 @@ export interface ResumenSemanalInfo {
   puedeCursar?: boolean;
   puedeRendir?: boolean;
   sesionExpirada?: boolean;
+  // Datos complementarios que no se pudieron obtener (tiempo agotado o error): nunca se omiten en silencio
+  datosFaltantes?: string[];
   alertas: string[];
   novedades?: ResumenNovedades;
 }
@@ -47,6 +51,56 @@ function conTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
 }
 
+// Igual que conTimeout pero para consultas que usan el mutex de Guaraní: el contador arranca recién cuando se
+// toma el lock (no cuenta la espera en cola). El lock se mantiene hasta que la consulta termina (no queda
+// ninguna petición suelta ejecutándose fuera del lock), pero quien llama recibe el error de tiempo al vencer.
+function conTimeoutEnLock<T>(fn: () => Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    withGuaraniLock(async () => {
+      const inner = fn();
+      inner.catch(() => {});
+      const timer = setTimeout(() => reject(new Error("tiempo de espera agotado")), ms);
+      try {
+        resolve(await inner);
+      } catch (err) {
+        reject(err);
+      } finally {
+        clearTimeout(timer);
+      }
+    }).catch(reject);
+  });
+}
+
+function motivo(r: PromiseRejectedResult): string {
+  return r.reason instanceof Error ? r.reason.message : String(r.reason);
+}
+
+// Snapshot por usuario (hash del email) con escritura atómica
+function snapshotPathDeUsuario(): string {
+  return path.join(CONFIG.CACHE_DIR, `resumen_snapshot_${getSessionUserKey()}.json`);
+}
+
+function escribirSnapshotAtomico(filePath: string, data: ResumenSnapshotData): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data), { encoding: "utf-8", mode: 0o600 });
+  try {
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
+}
+
+// Al cerrar sesión se purga todo CACHE_DIR; además se borra el snapshot de la sesión actual por las dudas
+registerSessionPurgeHook(() => {
+  try {
+    fs.unlinkSync(snapshotPathDeUsuario());
+  } catch {}
+});
+
 // Genera un resumen semanal consolidado consultando EVA y SIU Guaraní en paralelo
 export async function getResumenSemanal(carrera?: string): Promise<ResumenSemanalInfo> {
   const alertas: string[] = [];
@@ -55,8 +109,8 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
     getTareasYNotas(undefined, false),
     conTimeout(getForos(undefined, 10).then((f) => f.slice(0, 5)), 10000),
     getEstadoCursada(carrera),
-    conTimeout(getHorarioSemanal(carrera, "hoy"), 8000),
-    conTimeout(getMisInscripcionesExamen(carrera), 8000),
+    conTimeoutEnLock(() => getHorarioSemanal(carrera, "hoy"), 8000),
+    conTimeoutEnLock(() => getMisInscripcionesExamen(carrera), 8000),
     conTimeout(getArancelesYTramites("aranceles"), 6000)
   ]);
 
@@ -83,7 +137,17 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
     alertas.push(`⚠️ Error al sincronizar cursada e inasistencias de SIU Guaraní: ${err}`);
   }
 
-  // Datos complementarios (best-effort): si fallan o demoran no se reportan como error
+  // Datos complementarios: si fallan o demoran se avisa explícitamente qué datos faltaron
+  const datosFaltantes: string[] = [];
+  if (hoyRes.status === "rejected") datosFaltantes.push(`clases de hoy (${motivo(hoyRes)})`);
+  if (examenesRes.status === "rejected") datosFaltantes.push(`inscripciones a examen (${motivo(examenesRes)})`);
+  if (campusRes.status === "rejected") datosFaltantes.push(`situación de aranceles (${motivo(campusRes)})`);
+  if (examenesRes.status === "fulfilled" && examenesRes.value.parcial) {
+    datosFaltantes.push("inscripciones a examen (lectura incompleta de Guaraní)");
+  }
+  if (datosFaltantes.length > 0) {
+    alertas.push(`⚠️ No se pudieron obtener estos datos: ${datosFaltantes.join("; ")}. Reintentá en unos segundos.`);
+  }
   const clasesHoy = hoyRes.status === "fulfilled" ? hoyRes.value.clases : undefined;
   const examenesInscriptos =
     examenesRes.status === "fulfilled" && examenesRes.value.inscripciones.length > 0
@@ -103,7 +167,7 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
 
   // Detección de novedades comparando con snapshot anterior
   let novedades: ResumenNovedades | undefined;
-  const snapshotPath = path.join(CONFIG.CACHE_DIR, "resumen_snapshot.json");
+  const snapshotPath = snapshotPathDeUsuario();
   let prevSnapshot: ResumenSnapshotData | undefined;
   try {
     if (fs.existsSync(snapshotPath)) {
@@ -130,8 +194,10 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
     }
   } catch {}
 
-  // Guardar snapshot actualizado (preservando IDs de fuentes que hayan fallado)
+  // Guardar snapshot actualizado (preservando IDs de fuentes que hayan fallado). Si ambas fuentes fallaron
+  // no se toca el snapshot anterior.
   try {
+    if (tareasRes.status === "rejected" && forosRes.status === "rejected") throw new Error("sin datos nuevos");
     const currentSnapshot: ResumenSnapshotData = {
       timestamp: Math.floor(Date.now() / 1000),
       knownTaskIds:
@@ -143,7 +209,7 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
           ? avisosRecientes.map((a) => a.id)
           : prevSnapshot?.knownForumPostIds || []
     };
-    fs.writeFileSync(snapshotPath, JSON.stringify(currentSnapshot, null, 2), "utf-8");
+    escribirSnapshotAtomico(snapshotPath, currentSnapshot);
   } catch {}
 
   // Resumen compacto para optimizar tokens y latencia del LLM (omite texto extenso de tareas e historial detallado de inasistencias)
@@ -163,6 +229,7 @@ export async function getResumenSemanal(carrera?: string): Promise<ResumenSemana
       puedeCursar,
       puedeRendir,
       sesionExpirada: sesionExpirada || undefined,
+      datosFaltantes: datosFaltantes.length > 0 ? datosFaltantes : undefined,
       alertas,
       novedades
     })

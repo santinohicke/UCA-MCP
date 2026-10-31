@@ -3,6 +3,13 @@ import * as cheerio from "cheerio";
 
 const MAX_UNCOMPRESSED_SIZE = 60 * 1024 * 1024; // 60 MB límite anti-zip-bomb
 
+const MAX_OUTPUT_CHARS = 2 * 1024 * 1024; // 2 MB de texto de salida
+
+function capOutput(text: string): string {
+  if (text.length <= MAX_OUTPUT_CHARS) return text;
+  return text.slice(0, MAX_OUTPUT_CHARS) + "\n\n[Texto truncado: el documento supera los 2 MB de texto]";
+}
+
 function unzipFiltered(buffer: Uint8Array, pattern: RegExp): Record<string, Uint8Array> {
   const result: Record<string, Uint8Array> = {};
   let totalExtractedBytes = 0;
@@ -68,15 +75,30 @@ export function extractDocxText(buffer: Uint8Array): string {
   const xml = fflate.strFromU8(docFile);
   const $ = cheerio.load(xml, { xmlMode: true });
 
-  const paragraphs: string[] = [];
+  const parts: string[] = [];
+  let prevTc: any = null;
+  let prevTr: any = null;
+  let size = 0;
   $("w\\:p").each((_, p) => {
-    const text = $(p).find("w\\:t").map((_, t) => $(t).text()).get().join("");
-    if (text.trim().length > 0) {
-      paragraphs.push(text);
-    }
+    if (size > MAX_OUTPUT_CHARS) return false;
+    let text = "";
+    $(p).find("w\\:t, w\\:tab, w\\:br").each((__, el) => {
+      const name = (el as any).name;
+      if (name === "w:t") text += $(el).text();
+      else if (name === "w:tab") text += "\t";
+      else if (name === "w:br") text += "\n";
+    });
+    if (text.trim().length === 0) return;
+    const tc = $(p).closest("w\\:tc")[0] ?? null;
+    const tr = tc ? $(tc).closest("w\\:tr")[0] ?? null : null;
+    const sep = parts.length === 0 ? "" : tc && prevTc && tc !== prevTc && tr === prevTr ? "\t" : "\n\n";
+    parts.push(sep + text);
+    size += sep.length + text.length;
+    prevTc = tc;
+    prevTr = tr;
   });
 
-  return paragraphs.join("\n\n");
+  return capOutput(parts.join(""));
 }
 
 export function extractPptxText(buffer: Uint8Array): string {
@@ -95,13 +117,16 @@ export function extractPptxText(buffer: Uint8Array): string {
 
   const output: string[] = [];
   for (let i = 0; i < slideKeys.length; i++) {
+    if (output.join("").length > MAX_OUTPUT_CHARS) break;
     const key = slideKeys[i];
+    const slideNum = parseInt(/slide(\d+)\.xml$/.exec(key)?.[1] ?? "", 10) || i + 1;
     const xml = fflate.strFromU8(files[key]);
+    delete files[key];
     const $ = cheerio.load(xml, { xmlMode: true });
     const texts = $("a\\:t").map((_, el) => $(el).text()).get();
 
     if (texts.length > 0) {
-      output.push(`--- Diapositiva ${i + 1} ---\n${texts.join(" ")}`);
+      output.push(`--- Diapositiva ${slideNum} ---\n${texts.join(" ")}`);
     }
   }
 
@@ -118,7 +143,7 @@ function colLetterToIndex(colStr: string): number {
 }
 
 export function extractXlsxText(buffer: Uint8Array): string {
-  const files = unzipFiltered(buffer, /^(xl\/sharedStrings\.xml|xl\/worksheets\/sheet\d+\.xml)$/);
+  const files = unzipFiltered(buffer, /^(xl\/sharedStrings\.xml|xl\/workbook\.xml|xl\/_rels\/workbook\.xml\.rels|xl\/worksheets\/sheet\d+\.xml)$/);
 
   // 1. Parsear cadenas compartidas (sharedStrings.xml)
   const sharedStrings: string[] = [];
@@ -126,7 +151,7 @@ export function extractXlsxText(buffer: Uint8Array): string {
     const sstXml = fflate.strFromU8(files["xl/sharedStrings.xml"]);
     const $sst = cheerio.load(sstXml, { xmlMode: true });
     $sst("si").each((_, si) => {
-      const text = $sst(si).find("t").map((_, t) => $sst(t).text()).get().join("");
+      const text = $sst(si).find("t").filter((_, t) => (t as any).parent?.name !== "rPh").map((_, t) => $sst(t).text()).get().join("");
       sharedStrings.push(text);
     });
   }
@@ -140,9 +165,35 @@ export function extractXlsxText(buffer: Uint8Array): string {
       return numA - numB;
     });
 
+  // Nombres reales de hoja desde workbook.xml (+ rels para mapear al archivo)
+  const sheetNames: Record<string, string> = {};
+  try {
+    if (files["xl/workbook.xml"]) {
+      const rels: Record<string, string> = {};
+      if (files["xl/_rels/workbook.xml.rels"]) {
+        const $r = cheerio.load(fflate.strFromU8(files["xl/_rels/workbook.xml.rels"]), { xmlMode: true });
+        $r("Relationship").each((_, el) => {
+          const id = $r(el).attr("Id");
+          const target = $r(el).attr("Target");
+          if (id && target) rels[id] = "xl/" + target.replace(/^\/?(xl\/)?/, "");
+        });
+      }
+      const $w = cheerio.load(fflate.strFromU8(files["xl/workbook.xml"]), { xmlMode: true });
+      $w("sheet").each((idx, el) => {
+        const name = $w(el).attr("name");
+        const rid = $w(el).attr("r:id");
+        const file = (rid && rels[rid]) || `xl/worksheets/sheet${idx + 1}.xml`;
+        if (name) sheetNames[file] = name;
+      });
+    }
+  } catch {}
+
   const output: string[] = [];
+  let outSize = 0;
   for (let s = 0; s < sheetKeys.length; s++) {
+    if (outSize > MAX_OUTPUT_CHARS) break;
     const sheetXml = fflate.strFromU8(files[sheetKeys[s]]);
+    delete files[sheetKeys[s]];
     const $sheet = cheerio.load(sheetXml, { xmlMode: true });
     const sheetRows: string[] = [];
 
@@ -174,7 +225,7 @@ export function extractXlsxText(buffer: Uint8Array): string {
           const idx = parseInt(v, 10);
           val = sharedStrings[idx] ?? v;
         } else if (type === "inlineStr") {
-          val = $sheet(cell).find("is t").text();
+          val = $sheet(cell).find("is t").filter((_, t) => (t as any).parent?.name !== "rPh").text();
         } else if (type === "b") {
           val = v === "1" ? "VERDADERO" : "FALSO";
         } else if (type === "str") {

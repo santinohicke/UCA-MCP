@@ -3,7 +3,7 @@ import path from "node:path";
 import * as cheerio from "cheerio";
 import { guaraniFetch } from "../shared/http.js";
 import { getMesasDisponibles, ensureCarreraActiva, unwrapChulupiHtml, withGuaraniLock, readGuaraniText, matchMateriaFilter } from "./client.js";
-import { showNativeConfirmation } from "../shared/native-confirm.js";
+import { showNativeConfirmation, sanitizeDialogText } from "../shared/native-confirm.js";
 import { logger } from "../shared/logger.js";
 import { CONFIG } from "../config.js";
 
@@ -195,35 +195,60 @@ export async function inscribirExamen(
       const resText = await readGuaraniText(response);
       let { errorMsg, comprobanteText } = parseGuaraniInscripcionResponse(resText);
 
+      // Relee /examen y devuelve true/false si pudo verificar, o undefined si no se pudo verificar
+      const verificarInscripto = async (): Promise<boolean | undefined> => {
+        try {
+          const checkRes = await guaraniFetch("/examen");
+          const checkRaw = await readGuaraniText(checkRes);
+          const checkHtml = unwrapChulupiHtml(checkRaw);
+          const $check = cheerio.load(checkHtml);
+          return (
+            $check(".inscripto, .mesa-inscripta, tr.inscripta")
+              .filter((_, el) => $check(el).text().toLowerCase().includes(materia.toLowerCase()))
+              .length > 0
+          );
+        } catch {
+          return undefined;
+        }
+      };
+
+      const estadoDesconocido = (motivo: string): InscribirExamenResult => {
+        logger.warn(`Inscripción a ${materia} en estado indeterminado tras POST.`);
+        return {
+          exito: false,
+          aprobado: true,
+          mensaje: `Estado desconocido: ${motivo} NO reintentes esta operación para evitar registros duplicados o inconsistencias. Consultá tus inscripciones en https://guarani.uca.edu.ar`,
+          instruccion: "NO reintentes esta operación. Verificá el estado de inscripción directamente en el portal de Guaraní (tus inscripciones a exámenes).",
+          detalles: {
+            carrera,
+            materia,
+            llamadoId,
+            fecha: mesa.fecha,
+            hora: mesa.hora
+          }
+        };
+      };
+
+      // Error ambiguo después del POST: verificar el estado real antes de declarar fallo
       if (errorMsg || !response.ok) {
-        throw new Error(`Fallo en la inscripción de examen en SIU Guaraní: ${errorMsg || `HTTP ${response.status}`}`);
+        const detalleErr = errorMsg || `HTTP ${response.status}`;
+        const verificado = await verificarInscripto();
+        if (verificado === true) {
+          errorMsg = undefined;
+          comprobanteText = comprobanteText || `Confirmada en SIU Guaraní (sin código alfanumérico explícito)`;
+        } else if (verificado === undefined) {
+          return estadoDesconocido(`SIU Guaraní respondió con un error (${detalleErr}) y no se pudo verificar si la inscripción a ${materia} quedó registrada.`);
+        } else {
+          throw new Error(`Fallo en la inscripción de examen en SIU Guaraní: ${detalleErr}. Se verificó que la inscripción NO figura registrada.`);
+        }
       }
 
       // Si la respuesta no trajo comprobante explícito, releer la página para confirmar que la mesa figura inscripta
       if (!comprobanteText) {
-        const checkRes = await guaraniFetch("/examen");
-        const checkRaw = await readGuaraniText(checkRes);
-        const checkHtml = unwrapChulupiHtml(checkRaw);
-        const $check = cheerio.load(checkHtml);
-        const yaInscripto = $check(".inscripto, .mesa-inscripta, tr.inscripta")
-          .filter((_, el) => $check(el).text().toLowerCase().includes(materia.toLowerCase()))
-          .length > 0;
+        const yaInscripto = await verificarInscripto();
 
         if (!yaInscripto) {
-          logger.warn(`Inscripción a ${materia} en estado indeterminado tras POST.`);
-          return {
-            exito: false,
-            aprobado: true,
-            mensaje: `Estado desconocido: La solicitud de inscripción a ${materia} fue procesada por el servidor pero no devolvió código de comprobante ni se reflejó en el listado de inscriptos. NO reintentes esta operación para evitar registros duplicados o inconsistencias. Verificá tu situación académica en https://guarani.uca.edu.ar`,
-            instruccion: "NO reintentes esta operación. Verificá el estado de inscripción directamente en el portal de Guaraní.",
-            detalles: {
-              carrera,
-              materia,
-              llamadoId,
-              fecha: mesa.fecha,
-              hora: mesa.hora
-            }
-          };
+          return estadoDesconocido(`La solicitud de inscripción a ${materia} fue procesada por el servidor pero no devolvió código de comprobante ni se reflejó en el listado de inscriptos.`);
         }
         comprobanteText = `Confirmada en SIU Guaraní (sin código alfanumérico explícito)`;
       }
@@ -324,6 +349,16 @@ export function parseSolicitudesListado(html: string): SolicitudListadoItem[] {
   const $ = cheerio.load(unwrapChulupiHtml(html));
   const items: SolicitudListadoItem[] = [];
 
+  // Las columnas se ubican por el texto del encabezado (Constancia, Fecha solicitud, Presentar a, Estado, Fecha vencimiento);
+  // si no hay encabezado reconocible se usan los índices históricos.
+  const headers = $("table thead th").map((_, th) => $(th).text().replace(/\s+/g, " ").trim().toLowerCase()).get();
+  const colIdx = (re: RegExp): number => headers.findIndex((h) => re.test(h));
+  const colTipo = colIdx(/^constancia|^tipo/);
+  const colFecha = colIdx(/fecha.*solicitud|^fecha$/);
+  const colPresentar = colIdx(/presentar/);
+  const colEstado = colIdx(/^estado/);
+  const usaEncabezados = colTipo >= 0 && colFecha >= 0;
+
   $("table tbody tr, tr.solicitud, .solicitud-item").each((_, tr) => {
     const text = $(tr).text().replace(/\s+/g, " ").trim();
     if (!text || text.includes("No hay solicitudes")) return;
@@ -334,10 +369,10 @@ export function parseSolicitudesListado(html: string): SolicitudListadoItem[] {
     const id = typeof idMatch === "string" ? idMatch : idMatch ? idMatch[1] : undefined;
     const cells = $(tr).find("td").map((__, td) => $(td).text().replace(/\s+/g, " ").trim()).get();
 
-    const tipo = cells[1] || cells[0] || text;
-    const presentarA = cells[2] || undefined;
-    const estado = cells[3] || undefined;
-    const fecha = cells[4] || undefined;
+    const tipo = usaEncabezados ? cells[colTipo] || text : cells[1] || cells[0] || text;
+    const presentarA = (usaEncabezados ? (colPresentar >= 0 ? cells[colPresentar] : undefined) : cells[2]) || undefined;
+    const estado = (usaEncabezados ? (colEstado >= 0 ? cells[colEstado] : undefined) : cells[3]) || undefined;
+    const fecha = (usaEncabezados ? cells[colFecha] : cells[4]) || undefined;
 
     items.push({
       id,
@@ -360,11 +395,24 @@ export async function solicitarCertificadoAlumnoRegular(
   const {
     carrera,
     tipoConstancia = "alumno_regular",
-    presentarA = "A quien corresponda",
     copias = 1,
-    observaciones = "",
     forzarNueva = false
   } = params;
+
+  // Lo enviado debe ser exactamente lo mostrado en el diálogo (sanitizado): si difiere, se rechaza
+  const presentarNorm = (params.presentarA ?? "").trim();
+  const presentarA = presentarNorm || "A quien corresponda";
+  if (sanitizeDialogText(presentarA, 100, false) !== presentarA) {
+    throw new Error(
+      "El campo 'presentarA' contiene caracteres no permitidos, saltos de línea o supera los 100 caracteres. Simplificalo para poder verificarlo íntegramente en el diálogo de autorización."
+    );
+  }
+  const observaciones = (params.observaciones ?? "").replace(/\r\n|\r/g, "\n").trim();
+  if (observaciones && sanitizeDialogText(observaciones, 300, true) !== observaciones) {
+    throw new Error(
+      "Las observaciones contienen formato o caracteres no permitidos, o superan los 300 caracteres. Simplificalas para poder verificarlas íntegramente en el diálogo de autorización."
+    );
+  }
 
   if (tipoConstancia === "examen_final" || tipoConstancia === "examen_parcial") {
     throw new Error(
@@ -526,13 +574,18 @@ export async function solicitarCertificadoAlumnoRegular(
       await ensureCarreraActiva(carrera, true);
 
       // Snapshot de URLs de solicitudes existentes para detectar con precisión el nuevo registro
-      const previousUrls = new Set<string>();
+      const solicitudKey = (s: SolicitudListadoItem): string =>
+        s.urlDescarga || (s.id ? `id:${s.id}` : `${s.tipo}|${s.fecha || ""}|${s.presentarA || ""}`);
+      const previousKeys = new Set<string>();
+      let snapshotOk = false;
       try {
         const prevListRes = await guaraniFetch("/solicitudes");
         const prevListHtml = unwrapChulupiHtml(await readGuaraniText(prevListRes));
         for (const s of parseSolicitudesListado(prevListHtml)) {
-          if (s.urlDescarga) previousUrls.add(s.urlDescarga);
+          previousKeys.add(solicitudKey(s));
+          if (s.id) previousKeys.add(`id:${s.id}`);
         }
+        snapshotOk = true;
       } catch {}
 
       const body = new URLSearchParams({
@@ -553,30 +606,65 @@ export async function solicitarCertificadoAlumnoRegular(
 
       const rawText = await readGuaraniText(response);
       const parsedRes = parseGuaraniInscripcionResponse(rawText);
-
-      if (parsedRes.errorMsg) {
-        throw new Error(`SIU Guaraní rechazó la emisión de la constancia: ${parsedRes.errorMsg}`);
+      // Detectar errores también cuando la respuesta es HTML envuelto (Chulupi)
+      if (!parsedRes.errorMsg) {
+        const alt = parseGuaraniInscripcionResponse(unwrapChulupiHtml(rawText));
+        if (alt.errorMsg) parsedRes.errorMsg = alt.errorMsg;
       }
+      // Tras guardar, Guaraní responde con una redirección Chulupi (cod -2) al listado: no es un error.
+      // El resultado real se confirma releyendo /solicitudes.
+      const redirigidoAlListado = /"cod"\s*:\s*"?-2"?/.test(rawText) && !/\/login/i.test(rawText);
+      const errorPost =
+        (redirigidoAlListado ? undefined : parsedRes.errorMsg) || (!response.ok ? `HTTP ${response.status}` : undefined);
+
+      const estadoDesconocido = (motivo: string): SolicitarCertificadoResult => {
+        logger.warn(`Solicitud de constancia en estado indeterminado: ${motivo}`);
+        return {
+          exito: false,
+          aprobado: true,
+          mensaje: `Estado desconocido: ${motivo} NO reintentes la solicitud para evitar constancias duplicadas. Verificá el listado en https://guarani.uca.edu.ar (Solicitudes).`,
+          tipoConstancia: constanciaInfo.nombre,
+          presentarA,
+          copias: safeCopias,
+          instruccion: "NO reintentes la solicitud. Consultá el historial de constancias (o el portal de Guaraní) para verificar si se registró."
+        };
+      };
 
       // Releer listado de solicitudes para obtener enlace de descarga del PDF generado
       await onProgress?.("Obteniendo constancia emitida en PDF...", 90);
-      const listRes = await guaraniFetch("/solicitudes");
-      const listHtml = unwrapChulupiHtml(await readGuaraniText(listRes));
-      const solicitudes = parseSolicitudesListado(listHtml);
-      // Priorizar solicitud nueva no presente en el snapshot previo
-      const nueva =
-        solicitudes.find(
-          (s) =>
-            s.urlDescarga &&
-            !previousUrls.has(s.urlDescarga) &&
-            (s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
-              (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular")))
-        ) ||
-        solicitudes.find(
-          (s) =>
-            s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
-            (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular"))
+      let solicitudes: SolicitudListadoItem[];
+      try {
+        const listRes = await guaraniFetch("/solicitudes");
+        const listHtml = unwrapChulupiHtml(await readGuaraniText(listRes));
+        solicitudes = parseSolicitudesListado(listHtml);
+      } catch {
+        return estadoDesconocido(
+          `${errorPost ? `SIU Guaraní respondió con un error (${errorPost}) y ` : ""}no se pudo releer el listado de solicitudes para verificar si la constancia quedó registrada.`
         );
+      }
+      // Solo se acepta una solicitud NUEVA (ausente en el snapshot previo); nunca una constancia vieja del mismo tipo
+      const nueva = snapshotOk
+        ? solicitudes.find(
+            (s) =>
+              !previousKeys.has(solicitudKey(s)) &&
+              !(s.id && previousKeys.has(`id:${s.id}`)) &&
+              (s.tipo.toLowerCase().includes(constanciaInfo.nombre.toLowerCase()) ||
+                (tipoConstancia === "alumno_regular" && s.tipo.toLowerCase().includes("alumno regular")))
+          )
+        : undefined;
+
+      if (!nueva) {
+        if (errorPost && snapshotOk) {
+          throw new Error(
+            `SIU Guaraní rechazó la emisión de la constancia: ${errorPost}. Se verificó que no figura una solicitud nueva en tu listado.`
+          );
+        }
+        return estadoDesconocido(
+          errorPost
+            ? `SIU Guaraní respondió con un error (${errorPost}) y no se pudo confirmar si la constancia quedó registrada.`
+            : "la solicitud fue enviada pero no se detectó una solicitud nueva en tu listado."
+        );
+      }
 
       let destPath: string | undefined;
       if (nueva?.urlDescarga) {

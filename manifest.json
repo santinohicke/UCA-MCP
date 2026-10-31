@@ -1,11 +1,12 @@
 {
   "manifest_version": "0.1",
   "name": "uca-mcp",
-  "display_name": "UCA MCP - Asistente Académico",
-  "version": "1.0.8",
-  "description": "Conectá EVA Moodle, SIU Guaraní y Campus Autogestión con Claude sin usar la terminal.",
+  "display_name": "UCA MCP",
+  "version": "1.0.9",
+  "description": "Conectá EVA, SIU Guaraní y Campus Autogestión con Claude sin usar la terminal.",
   "author": {
-    "name": "Comunidad Estudiantil UCA"
+    "name": "Santino Hickethier",
+    "url": "https://github.com/santinohicke"
   },
   "homepage": "https://github.com/santinohicke/uca-mcp",
   "compatibility": {
@@ -54,7 +55,7 @@
     },
     {
       "name": "eva_materias",
-      "description": "Lista las aulas virtuales y materias matriculadas en EVA Moodle con sus identificadores de curso."
+      "description": "Lista las aulas virtuales y materias matriculadas en EVA con sus identificadores de curso."
     },
     {
       "name": "eva_contenido_curso",
@@ -62,7 +63,7 @@
     },
     {
       "name": "eva_cronograma",
-      "description": "Busca el archivo de cronograma o programa de una materia en EVA Moodle y extrae las fechas de parciales, recuperatorios y entregas."
+      "description": "Busca el archivo de cronograma o programa de una materia en EVA y extrae las fechas de parciales, recuperatorios y entregas."
     },
     {
       "name": "eva_entregas_proximas",
@@ -70,11 +71,11 @@
     },
     {
       "name": "eva_cuestionarios",
-      "description": "Consulta cuestionarios, exámenes parciales online, fechas de apertura/cierre, intentos y calificaciones en EVA Moodle (Lectura pura)."
+      "description": "Consulta cuestionarios, exámenes parciales online, fechas de apertura/cierre, intentos y calificaciones en EVA (Lectura pura)."
     },
     {
       "name": "eva_tareas_y_notas",
-      "description": "Obtiene tareas, plazos de entrega, estado de entregas y fechas límite en EVA Moodle."
+      "description": "Obtiene tareas, plazos de entrega, estado de entregas y fechas límite en EVA."
     },
     {
       "name": "eva_foros",
@@ -82,7 +83,7 @@
     },
     {
       "name": "eva_hilo_foro",
-      "description": "Obtiene el debate o hilo completo de un foro de cátedra en EVA Moodle, con todas sus respuestas."
+      "description": "Obtiene el debate o hilo completo de un foro de cátedra en EVA, con todas sus respuestas."
     },
     {
       "name": "eva_buscar_materiales",
@@ -94,11 +95,11 @@
     },
     {
       "name": "eva_guardar_borrador_tarea",
-      "description": "[EXPERIMENTAL] Sube un archivo o texto a EVA Moodle en modo borrador editable (Canal B)."
+      "description": "[EXPERIMENTAL] Sube un archivo o texto a EVA en modo borrador editable (Canal B)."
     },
     {
       "name": "eva_responder_foro",
-      "description": "Publica una respuesta en un foro de cátedra de EVA Moodle (Canal B)."
+      "description": "Publica una respuesta en un foro de cátedra de EVA (Canal B)."
     },
     {
       "name": "guarani_progreso_carrera",

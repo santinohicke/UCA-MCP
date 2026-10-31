@@ -30,7 +30,7 @@ function getPackageVersion(): string {
       dir = path.dirname(dir);
     }
   } catch {}
-  return "1.0.7";
+  return "0.0.0";
 }
 
 const PACKAGE_VERSION = getPackageVersion();
@@ -76,6 +76,8 @@ export const CONFIG = {
 };
 
 let storageInitialized = false;
+const ONE_HOUR = 60 * 60 * 1000;
+const CACHE_MAX_BYTES = 300 * 1024 * 1024;
 
 // Asegura existencia de carpetas locales y purga staging al arrancar (se ejecuta una única vez por proceso)
 export function initStorage(force = false): void {
@@ -89,7 +91,9 @@ export function initStorage(force = false): void {
       for (const file of fs.readdirSync(CONFIG.BASE_DIR)) {
         if (/^session\.enc\..*\.tmp$/.test(file)) {
           try {
-            fs.unlinkSync(path.join(CONFIG.BASE_DIR, file));
+            const fp = path.join(CONFIG.BASE_DIR, file);
+            // Solo huérfanos viejos: otro cliente MCP abierto podría estar escribiendo ahora
+            if (Date.now() - fs.statSync(fp).mtimeMs > ONE_HOUR) fs.unlinkSync(fp);
           } catch {}
         }
       }
@@ -102,7 +106,8 @@ export function initStorage(force = false): void {
       const files = fs.readdirSync(CONFIG.STAGING_DIR);
       for (const file of files) {
         try {
-          fs.unlinkSync(path.join(CONFIG.STAGING_DIR, file));
+          const fp = path.join(CONFIG.STAGING_DIR, file);
+          if (Date.now() - fs.statSync(fp).mtimeMs > ONE_HOUR) fs.rmSync(fp, { recursive: true, force: true });
         } catch {}
       }
     } catch {}
@@ -127,18 +132,35 @@ export function initStorage(force = false): void {
   if (!fs.existsSync(CONFIG.CACHE_DIR)) {
     fs.mkdirSync(CONFIG.CACHE_DIR, { recursive: true, mode: 0o700 });
   } else {
-    // Purgar archivos de caché mayores a 7 días (TTL) excluyendo grafos de correlatividades ya versionados
+    // Purgar caché mayor a 30 días (excepto correlativas_*) y limitar el tamaño total (borra lo más viejo primero)
     try {
-      const maxAge = 7 * 24 * 60 * 60 * 1000;
+      const maxAge = 30 * 24 * 60 * 60 * 1000;
       const now = Date.now();
+      const entries: { fp: string; size: number; mtime: number; keep: boolean }[] = [];
       for (const file of fs.readdirSync(CONFIG.CACHE_DIR)) {
-        if (file.startsWith("correlativas_")) continue;
         const filePath = path.join(CONFIG.CACHE_DIR, file);
         try {
-          if (now - fs.statSync(filePath).mtimeMs > maxAge) {
+          const st = fs.statSync(filePath);
+          if (!st.isFile()) continue;
+          const keep = file.startsWith("correlativas_");
+          if (!keep && now - st.mtimeMs > maxAge) {
             fs.unlinkSync(filePath);
+            continue;
           }
+          entries.push({ fp: filePath, size: st.size, mtime: st.mtimeMs, keep });
         } catch {}
+      }
+      let total = entries.reduce((a, e) => a + e.size, 0);
+      if (total > CACHE_MAX_BYTES) {
+        entries.sort((x, y) => x.mtime - y.mtime);
+        for (const e of entries) {
+          if (total <= CACHE_MAX_BYTES) break;
+          if (e.keep) continue;
+          try {
+            fs.unlinkSync(e.fp);
+            total -= e.size;
+          } catch {}
+        }
       }
     } catch {}
   }
