@@ -3,6 +3,9 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20.18.1-brightgreen.svg)](https://nodejs.org)
 [![Licencia](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-purple.svg)](https://modelcontextprotocol.io)
+[![Sitio web](https://img.shields.io/badge/web-ucamcp.com-1747C9.svg)](https://ucamcp.com)
+
+**Sitio web: [ucamcp.com](https://ucamcp.com)** — guía de instalación, preguntas frecuentes y documentación en lenguaje simple.
 
 Servidor **Model Context Protocol (MCP)** open source para conectar a tus asistentes de IA (Claude Desktop, Cursor, VS Code, Gemini, etc.) de forma segura y directa con las plataformas institucionales de la **Universidad Católica Argentina**:
 - **EVA** (`eva.uca.edu.ar`)
