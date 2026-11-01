@@ -33,7 +33,7 @@ Elegí tu cliente y seguí los pasos. El `uca-mcp login` abre el navegador para 
 
 **Opción A — Sin terminal (recomendada):**
 
-1. Descargá [`uca-mcp-1.0.10.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
+1. Descargá [`uca-mcp-1.1.0.mcpb`](https://github.com/santinohicke/UCA-MCP/releases) desde Releases.
 2. En Claude Desktop andá a **Configuración → Extensiones** y arrastrá el archivo `.mcpb`.
 3. Abrí un nuevo chat y escribí *"Iniciá sesión en UCA"*. Listo.
 
@@ -188,6 +188,7 @@ Comprueba Node.js, llavero del sistema, navegador, diálogo nativo y conectivida
 | `eva_foros` | EVA | Lectura | Obtiene avisos de cátedra y discusiones recientes (con aviso de contenido no confiable). |
 | `eva_hilo_foro` | EVA | Lectura | Obtiene el debate o hilo completo de un foro de cátedra con todas sus respuestas y mensajes. |
 | `eva_buscar_materiales` | EVA | Lectura | Busca recursos y consignas por palabra clave en todas tus aulas. |
+| `eva_descargar_materiales` | EVA | Lectura (guarda en tu PC) | Baja a una carpeta de tu computadora los parciales, apuntes y archivos de una materia (también los que están dentro de carpetas). |
 | `eva_leer_archivo` | EVA | Lectura | Descarga y extrae texto de PDFs y Office (.docx/.xlsx/.pptx) con allowlist estricta HTTPS y anti zip-bombs. |
 | `eva_guardar_borrador_tarea` | EVA | Mutación | Sube un borrador editable de entrega tras validación y **tu confirmación**. |
 | `eva_responder_foro` | EVA | Mutación | Publica una respuesta en un foro mostrando el texto completo tras **tu confirmación**. |

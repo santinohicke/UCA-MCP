@@ -2,13 +2,13 @@
   "manifest_version": "0.1",
   "name": "uca-mcp",
   "display_name": "UCA MCP",
-  "version": "1.0.10",
+  "version": "1.1.0",
   "description": "Conectá EVA, SIU Guaraní y Campus Autogestión con Claude sin usar la terminal.",
   "author": {
     "name": "Santino Hickethier",
     "url": "https://github.com/santinohicke"
   },
-  "homepage": "https://github.com/santinohicke/uca-mcp",
+  "homepage": "https://ucamcp.com",
   "compatibility": {
     "platforms": [
       "win32",
@@ -88,6 +88,10 @@
     {
       "name": "eva_buscar_materiales",
       "description": "Busca recursos, consignas y documentos en EVA por palabra clave."
+    },
+    {
+      "name": "eva_descargar_materiales",
+      "description": "Descarga parciales, apuntes y otros archivos de una materia de EVA a una carpeta de tu computadora."
     },
     {
       "name": "eva_leer_archivo",

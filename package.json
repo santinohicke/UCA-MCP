@@ -1,6 +1,6 @@
 {
   "name": "uca-mcp",
-  "version": "1.0.10",
+  "version": "1.1.0",
   "description": "Model Context Protocol (MCP) server para la Universidad Católica Argentina (UCA) - Proyecto No Oficial",
   "type": "module",
   "bin": {
@@ -18,6 +18,7 @@
     "LICENSE",
     "tsconfig.json"
   ],
+  "homepage": "https://ucamcp.com",
   "license": "MIT",
   "author": "Santino Hickethier",
   "repository": {
@@ -37,7 +38,7 @@
     "logout": "node build/bin/cli.js logout",
     "pack:mcpb": "node scripts/vendor-pdfjs.mjs && tsc && node scripts/bundle.mjs && node scripts/pack-mcpb.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/smoke.mjs"
+    "test": "node scripts/test-materiales.mjs && node scripts/smoke.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

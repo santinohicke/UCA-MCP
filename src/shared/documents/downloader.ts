@@ -178,16 +178,10 @@ export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefre
     const $h = cheerio.load(htmlText);
 
     if (new URL(currentUrl).pathname.includes("/mod/folder/view.php")) {
-      const files: string[] = [];
-      $h(".fp-filename, a[href*='/pluginfile.php']").each((_, el) => {
-        const text = $h(el).text().trim();
-        const href = $h(el).attr("href");
-        if (text && href && !files.some((f) => f.includes(href))) {
-          files.push(`- ${text} -> ${href}`);
-        }
-      });
+      const folderFiles = parseFolderHtml(htmlText, currentUrl);
+      const files = folderFiles.map((f) => `- ${f.name} -> ${f.url}`);
       const listingText = files.length > 0
-        ? `Contenido de la carpeta en EVA:\n\n${files.join("\n")}`
+        ? "Contenido de la carpeta en EVA:\n\n" + files.join("\n")
         : "La carpeta en EVA se encuentra vacía o no contiene archivos descargables.";
       const listingBuf = new TextEncoder().encode(listingText);
       return {
@@ -242,6 +236,48 @@ export async function downloadSecureFile(fileUrl: string, depth = 0, forzarRefre
   }
 
   return result;
+}
+
+// Extrae los archivos (/pluginfile.php) de la página HTML de una carpeta Moodle
+export function parseFolderHtml(html: string, baseUrl: string = CONFIG.EVA_BASE_URL): Array<{ name: string; url: string }> {
+  const $h = cheerio.load(html);
+  const allowedOrigin = new URL(CONFIG.EVA_BASE_URL).origin;
+  const out: Array<{ name: string; url: string }> = [];
+  const seen = new Set<string>();
+  $h("a[href*='/pluginfile.php']").each((_, el) => {
+    const href = $h(el).attr("href");
+    if (!href) return;
+    let u: URL;
+    try { u = new URL(href, baseUrl); } catch { return; }
+    if (u.protocol !== "https:" || u.origin !== allowedOrigin || !u.pathname.startsWith("/pluginfile.php")) return;
+    const key = u.origin + u.pathname;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const name = $h(el).find(".fp-filename").first().text().trim() ||
+      $h(el).text().trim() ||
+      safeDecode(u.pathname.split("/").pop() || "") || "archivo";
+    out.push({ name, url: u.href });
+  });
+  return out;
+}
+
+// Lista los archivos de una carpeta Moodle (/mod/folder/view.php) con la misma validación de host/ruta que la descarga
+export async function listFolderFiles(folderUrl: string): Promise<Array<{ name: string; url: string }>> {
+  const parsed = new URL(folderUrl, CONFIG.EVA_BASE_URL);
+  const allowedOrigin = new URL(CONFIG.EVA_BASE_URL).origin;
+  if (parsed.protocol !== "https:" || parsed.origin !== allowedOrigin) {
+    throw new Error(`Acceso denegado: solo se permiten descargas HTTPS desde ${CONFIG.EVA_BASE_URL}. Destino no permitido: '${parsed.origin}'`);
+  }
+  if (parsed.pathname !== "/mod/folder/view.php") {
+    throw new Error(`Ruta no autorizada para listar carpeta: '${parsed.pathname}'.`);
+  }
+  const response = await evaFetch(parsed.href, { signal: AbortSignal.timeout(60000) });
+  const finalParsed = new URL(response.url || parsed.href, CONFIG.EVA_BASE_URL);
+  if (finalParsed.protocol !== "https:" || finalParsed.origin !== allowedOrigin || finalParsed.pathname !== "/mod/folder/view.php") {
+    throw new Error(`Redirección no permitida al listar carpeta: '${finalParsed.origin}${finalParsed.pathname}'`);
+  }
+  if (!response.ok) throw new Error(`Error al listar carpeta: HTTP ${response.status}`);
+  return parseFolderHtml(await response.text(), finalParsed.href);
 }
 
 function safeDecode(s: string): string {

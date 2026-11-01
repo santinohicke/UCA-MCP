@@ -37,7 +37,8 @@ import { getArancelesYTramites } from "./campus/client.js";
 import { getResumenSemanal } from "./resumen/client.js";
 import { guardarBorradorTarea, responderForo } from "./eva/mutations.js";
 import { inscribirExamen, solicitarCertificadoAlumnoRegular, getHistorialConstancias } from "./guarani/mutations.js";
-import { downloadSecureFile } from "./shared/documents/downloader.js";
+import { downloadSecureFile, listFolderFiles } from "./shared/documents/downloader.js";
+import { descargarMateriales, resolveDestino, normalizeText, type MaterialItem } from "./shared/documents/materials-downloader.js";
 import { extractPdfContent } from "./shared/documents/pdf-extractor.js";
 import { extractDocxText, extractPptxText, extractXlsxText, extractOdfText, detectImageMimeType } from "./shared/documents/office-extractor.js";
 import {
@@ -117,6 +118,7 @@ export interface ServerServices {
   getPlanOptimo?: typeof getPlanOptimo;
   getCronogramaEvaluaciones?: typeof getCronogramaEvaluaciones;
   downloadSecureFile?: typeof downloadSecureFile;
+  listFolderFiles?: typeof listFolderFiles;
   guardarBorradorTarea?: typeof guardarBorradorTarea;
   responderForo?: typeof responderForo;
   inscribirExamen?: typeof inscribirExamen;
@@ -149,6 +151,7 @@ export function createServer(services: ServerServices = {}): McpServer {
   const _getPlanOptimo = services.getPlanOptimo || getPlanOptimo;
   const _getCronogramaEvaluaciones = services.getCronogramaEvaluaciones || getCronogramaEvaluaciones;
   const _downloadSecureFile = services.downloadSecureFile || downloadSecureFile;
+  const _listFolderFiles = services.listFolderFiles || listFolderFiles;
   const _guardarBorradorTarea = services.guardarBorradorTarea || guardarBorradorTarea;
   const _responderForo = services.responderForo || responderForo;
   const _inscribirExamen = services.inscribirExamen || inscribirExamen;
@@ -790,6 +793,114 @@ export function createServer(services: ServerServices = {}): McpServer {
         };
       } catch (err) {
         return formatError("Error al buscar materiales", err);
+      }
+    }
+  );
+
+  // Tool 7b: eva_descargar_materiales
+  server.registerTool(
+    "eva_descargar_materiales",
+    {
+      title: "Descargar Materiales de EVA a una Carpeta",
+      description: "Descarga archivos de EVA (parciales, apuntes, guías, incluso los que están dentro de carpetas) a una carpeta de tu computadora. Ej: todos los parciales de una materia. Usá 'curso_id' (de eva_materias) y 'query' para filtrar por nombre. Guarda en Descargas/UCA si no indicás 'carpeta_destino'. No modifica nada en EVA.",
+      inputSchema: {
+        curso_id: z.number().int().min(1).optional().describe("ID del curso en EVA (recomendado; obtenelo con eva_materias)"),
+        query: z.string().max(100).optional().describe("Filtro por nombre, ej. 'parcial'. Sin filtro baja todos los archivos del curso (obligatorio si no hay curso_id)"),
+        seccion: z.string().max(100).optional().describe("Filtro por nombre de sección, ej. 'Archivo de Examenes' (coincidencia parcial)"),
+        carpeta_destino: z.string().max(500).optional().describe("Ruta absoluta de la carpeta donde guardar (admite ~). Por defecto Descargas/UCA/<materia>"),
+        max_archivos: z.number().int().min(1).max(500).optional().default(300).describe("Máximo de archivos a bajar (por defecto 300, máx 500)"),
+        forzar_refresco: z.boolean().optional().default(false).describe("Si es true, ignora la caché y vuelve a bajar de EVA")
+      },
+      outputSchema: {
+        carpeta: z.string(),
+        descargados: z.number(),
+        salteados: z.number(),
+        fallidos: z.array(z.any()),
+        ignorados: z.number(),
+        omitidos_por_limite: z.number(),
+        bytes_totales: z.number(),
+        archivos: z.array(z.string())
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+    },
+    async ({ curso_id, query, seccion, carpeta_destino, max_archivos, forzar_refresco }, extra) => {
+      const reportProgress = createProgressReporter(extra);
+      await reportProgress(5, 100, "Buscando materiales en EVA...");
+      try {
+        const q = (query ?? "").trim();
+        if (!curso_id && !q) {
+          throw new Error("Indicá 'curso_id' o 'query' para saber qué materiales descargar.");
+        }
+        const secFiltro = seccion ? normalizeText(seccion.trim()) : "";
+        let items: MaterialItem[];
+        let nombreCurso = "";
+        if (curso_id) {
+          const [secciones, materias] = await Promise.all([
+            _getContenidoCurso(curso_id, forzar_refresco),
+            _getMaterias(false).catch(() => [] as Array<{ id: number; nombre: string }>)
+          ]);
+          nombreCurso = materias.find((m) => m.id === curso_id)?.nombre ?? `Curso ${curso_id}`;
+          const nq = normalizeText(q);
+          items = [];
+          for (const sec of secciones) {
+            if (secFiltro && !normalizeText(sec.nombre).includes(secFiltro)) continue;
+            const secMatch = !nq || normalizeText(sec.nombre).includes(nq);
+            for (const m of sec.modulos) {
+              const nameMatch = secMatch || normalizeText(m.nombre).includes(nq);
+              if (!nameMatch && m.tipo !== "folder") continue;
+              items.push({ curso: nombreCurso, seccion: sec.nombre, nombre: m.nombre, tipo: m.tipo, url: m.url, coincide: nameMatch });
+            }
+          }
+        } else {
+          const found = await _buscarMateriales(q, undefined);
+          items = found
+            .filter((r) => !secFiltro || normalizeText(r.seccion).includes(secFiltro))
+            .map((r) => ({ ...r, coincide: true }));
+          nombreCurso = q;
+        }
+        const destino = resolveDestino(carpeta_destino, nombreCurso);
+        await reportProgress(15, 100, `Descargando ${items.length} recursos...`);
+        const res = await descargarMateriales(
+          {
+            items,
+            destino,
+            query: q,
+            maxArchivos: max_archivos ?? 300,
+            forzarRefresco: forzar_refresco ?? false,
+            concurrencia: 6,
+            onProgress: (hechos, total, mensaje) => reportProgress(15 + Math.floor((hechos / Math.max(total, 1)) * 84), 100, mensaje)
+          },
+          {
+            downloadFile: (url, refresh) => _downloadSecureFile(url, 0, refresh),
+            listFolderFiles: _listFolderFiles
+          }
+        );
+        await reportProgress(100, 100, "Descarga finalizada.");
+        const archivos = [...res.descargados, ...res.salteados];
+        const structured = {
+          carpeta: res.carpeta,
+          descargados: res.descargados.length,
+          salteados: res.salteados.length,
+          fallidos: res.fallidos.slice(0, 50),
+          ignorados: res.ignorados,
+          omitidos_por_limite: res.omitidosPorLimite,
+          bytes_totales: res.bytes,
+          archivos: archivos.slice(0, 100)
+        };
+        const mb = (res.bytes / (1024 * 1024)).toFixed(1);
+        const lineas = [
+          `Carpeta: ${res.carpeta}`,
+          `Descargados: ${res.descargados.length} (${mb} MB) | Ya existían: ${res.salteados.length} | Fallidos: ${res.fallidos.length} | Ignorados (no son archivos): ${res.ignorados}` +
+            (res.omitidosPorLimite ? ` | Omitidos por límite: ${res.omitidosPorLimite} (subí 'max_archivos' o filtrá)` : ""),
+          ...(archivos.length ? ["Archivos:", ...archivos.slice(0, 100).map((a) => `- ${a}`), ...(archivos.length > 100 ? [`... y ${archivos.length - 100} más`] : [])] : ["No se encontró ningún archivo descargable con esos filtros."]),
+          ...(res.fallidos.length ? ["Fallidos:", ...res.fallidos.slice(0, 50).map((f) => `- ${f.nombre}: ${f.motivo}`)] : [])
+        ];
+        return {
+          content: [{ type: "text", text: lineas.join("\n") }],
+          structuredContent: structured
+        };
+      } catch (err) {
+        return formatError("Error al descargar materiales", err);
       }
     }
   );
